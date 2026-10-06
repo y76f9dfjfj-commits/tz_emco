@@ -1,0 +1,59 @@
+# Проверки перед каждым коммитом. Python-инструменты запускаются из poetry-окружения,
+# поэтому их версии совпадают с poetry.lock, локально и в CI.
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, refactor, perf, test, docs, chore, ci, build, style, revert]
+
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: poetry run ruff format
+        language: system
+        types: [python]
+      - id: ruff-lint
+        name: ruff check
+        entry: poetry run ruff check --fix --exit-non-zero-on-fix
+        language: system
+        types: [python]
+      - id: mypy
+        name: mypy --strict
+        entry: poetry run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: bandit
+        name: bandit
+        entry: poetry run bandit -c pyproject.toml -q -r src
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: pytest
+        name: pytest (без брокера)
+        entry: make test
+        language: system
+        types: [python]
+        pass_filenames: false
