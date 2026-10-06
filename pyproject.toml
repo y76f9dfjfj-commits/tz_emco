@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Сервис виртуальных очередей к станциям по потоку телеметрии из Kafka"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-dependencies = []
+dependencies = ["pydantic (>=2.13.5,<3.0.0)"]
 
 [tool.poetry]
 packages = [{ include = "vqueue", from = "src" }]

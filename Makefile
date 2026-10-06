@@ -37,7 +37,7 @@ test-int: ## Запустить интеграционные тесты (нуж�
 cov: ## Тесты с покрытием и порогом
 	$(RUN) pytest -m "not integration" -q --cov --cov-report=term-missing
 
-check: lint typecheck security test ## Все проверки перед коммитом
+check: lint typecheck security cov ## Все проверки перед коммитом (с порогом покрытия)
 
 clean: ## Удалить кеши и артефакты
 	rm -rf .mypy_cache .ruff_cache .pytest_cache .hypothesis .coverage coverage.xml htmlcov dist build
