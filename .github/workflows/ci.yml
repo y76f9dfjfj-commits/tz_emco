@@ -1,0 +1,69 @@
+# Проверки на каждый push и pull request: те же хуки, что локально, плюс тесты на нескольких
+# версиях Python и сканирование всей истории git на секреты.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POETRY_VERSION: "2.4.2"
+
+jobs:
+  lint:
+    name: Линтеры, типы, безопасность
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: pipx install "poetry==${POETRY_VERSION}"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: poetry
+      - run: poetry install --no-interaction
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Все pre-commit хуки
+        run: poetry run pre-commit run --all-files --show-diff-on-failure
+
+  secrets-history:
+    name: Секреты во всей истории
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Тесты (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - run: pipx install "poetry==${POETRY_VERSION}"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: poetry
+      - run: poetry env use "python${{ matrix.python-version }}"
+      - run: poetry install --no-interaction
+      - run: make test
