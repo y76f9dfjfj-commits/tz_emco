@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Сервис виртуальных очередей к станциям по потоку телеметрии из Kafka"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-dependencies = ["pydantic (>=2.13.5,<3.0.0)"]
+dependencies = ["pydantic (>=2.13.5,<3.0.0)", "confluent-kafka (>=2.16.0,<3.0.0)"]
 
 [tool.poetry]
 packages = [{ include = "vqueue", from = "src" }]
@@ -56,6 +56,8 @@ markers = ["integration: тесты с реальным Kafka-брокером"]
 [tool.coverage.run]
 source = ["vqueue"]
 branch = true
+# Тонкие точки входа (сборка процессов, CLI, сигналы) покрываются интеграционным тестом с Kafka.
+omit = ["*/vqueue/processor_main.py", "*/vqueue/simulator/generator_main.py"]
 
 [tool.coverage.report]
 show_missing = true
