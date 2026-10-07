@@ -126,7 +126,7 @@ def test_station_in_zone_picks_matching_station() -> None:
 
 
 def test_station_in_zone_overlapping_radii_first_station_in_order() -> None:
-    """Пересекающиеся радиусы: выбирается первая по порядку site.stations (контракт)."""
+    """Пересекающиеся радиусы: первая по порядку site.stations (решение из README)."""
     a = S1_POINT
     b = north_of(S1_POINT, 30.0)
     between = north_of(S1_POINT, 15.0)
@@ -297,7 +297,7 @@ def test_advance_at_station_exactly_radius_to_unload() -> None:
 
 
 def test_advance_at_station_moving_into_other_station_radius_to_unload() -> None:
-    """Контракт: с AT_STATION S1 в радиус S2 в движении — S1 покинута, «к разгрузке».
+    """Решение из README: с AT_STATION S1 в радиус S2 в движении — S1 покинута, «к разгрузке».
 
     Момент входа в радиус S2 при этом фиксируется.
     """
@@ -309,7 +309,7 @@ def test_advance_at_station_moving_into_other_station_radius_to_unload() -> None
 
 
 def test_advance_at_station_stopped_at_other_station_at_that_station() -> None:
-    """Контракт: «в зоне и стоит» → «на станции» той станции, где стоит, из любой фазы."""
+    """Решение из README: «в зоне и стоит» → «на станции» той станции, где стоит, из любой фазы."""
     pos = north_of(S2_POINT, 10.0)
     track = advance(_at_s1(), tm(T0 + 300, pos, STOPPED), SITE)
     assert track.phase is UnitPhase.AT_STATION
@@ -378,7 +378,7 @@ def test_advance_to_unload_passing_station_radius_stays_to_unload() -> None:
 
 
 def test_advance_to_unload_stopped_in_station_radius_at_station() -> None:
-    """Контракт: остановка в радиусе станции — «на станции» из любой фазы."""
+    """Решение из README: остановка в радиусе станции — «на станции» из любой фазы."""
     track = advance(_to_unload(), tm(T0 + 1, NEAR_S1, STOPPED), SITE)
     assert track.phase is UnitPhase.AT_STATION
     assert track.station_id == S1_ID

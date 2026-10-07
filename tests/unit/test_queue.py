@@ -12,6 +12,10 @@
 
 Правило 3 занятия: машина в радиусе станции, пока станция занята другой, ждёт; её приезд —
 момент входа в радиус.
+
+ТЗ, «Рекомендация», п.1 (wait_before): ожидание машины — момент освобождения станции минус
+её приезд, но не меньше нуля; момент освобождения — free_at последней машины очереди, которая
+приедет раньше нашей (занявшая станцию — всегда раньше); если таких нет — станция свободна.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from vqueue.domain.queue import (
     build_station_queue,
     estimate_arrival,
     schedule,
+    wait_before,
 )
 from vqueue.domain.unit_fsm import StationZoneEntry, UnitTrack
 
@@ -207,7 +212,7 @@ def test_schedule_result_independent_of_input_permutation() -> None:
 
 
 def test_schedule_accepts_one_shot_iterator() -> None:
-    """Контракт: arrivals — любой Iterable, в том числе одноразовый генератор."""
+    """Аргумент arrivals — любой Iterable, в том числе одноразовый генератор."""
 
     def gen() -> Iterator[tuple[str, int]]:
         yield (T3, 200)
@@ -244,7 +249,7 @@ def test_estimate_to_station_counts_from_last_ts() -> None:
 
 
 def test_estimate_to_station_not_earlier_than_now() -> None:
-    """Контракт: позиция 20 с назад в 100 м (приезд «в прошлом») → eta = now."""
+    """Решение из README: позиция 20 с назад в 100 м (приезд «в прошлом») → eta = now."""
     track = _track(T2, north_of(S1_POINT, 100.0), last_ts=NOW - 20)
     assert estimate_arrival(track, S1, FREE_S1, SITE, NOW) == NOW
 
@@ -348,7 +353,7 @@ def test_estimate_to_station_through_other_station_radius_uses_distance() -> Non
 
 
 def test_estimate_at_other_station_excluded() -> None:
-    """Контракт: машина «на станции» у другой станции сюда не едет — не в очереди."""
+    """Решение из README: машина «на станции» у другой станции сюда не едет — не в очереди."""
     track = _track(
         T2,
         S2_POINT,
@@ -595,3 +600,166 @@ def test_build_queue_independent_of_tracks_order() -> None:
     for perm in itertools.permutations(tracks):
         assert build_station_queue(occ, perm, SITE, NOW) == expected
     assert [e.unit_id for e in expected.entries] == [T1, T4, T2, T3]
+
+
+# ---------------------------------------------------------------------------
+# wait_before (ТЗ, «Рекомендация», п.1)
+# ---------------------------------------------------------------------------
+
+
+def _occupant_entry(unit_id: str, free_at: int) -> QueueEntry:
+    """Запись занявшей станцию машины: eta None, обслуживание с free_at - 230."""
+    return QueueEntry(unit_id, None, free_at - OCC, free_at, 0)
+
+
+CANDIDATE: Final = "T0"
+"""Машина, для которой считается ожидание: id меньше всех в очереди — при равном eta она первая."""
+
+
+def _s1_queue(*entries: QueueEntry) -> StationQueue:
+    """Очередь S1 на NOW из заданных записей."""
+    return StationQueue(S1_ID, NOW, entries)
+
+
+def test_wait_before_empty_queue_is_zero() -> None:
+    """Рекомендация п.1: в очереди никого — станция свободна, ожидание 0."""
+    assert wait_before(_s1_queue(), NOW + 90, CANDIDATE) == 0
+
+
+def test_wait_before_empty_queue_eta_in_past_is_zero() -> None:
+    """Рекомендация п.1: пустая очередь и приезд «в прошлом» (ждёт в радиусе) — ожидание 0."""
+    assert wait_before(_s1_queue(), NOW - 100, CANDIDATE) == 0
+
+
+def test_wait_before_only_occupant_waits_until_its_free_at() -> None:
+    """Рекомендация п.1: только занявшая (eta None) освободит в NOW+200 → ждать 200 - 90."""
+    assert wait_before(_s1_queue(_occupant_entry(T1, NOW + 200)), NOW + 90, CANDIDATE) == 110
+
+
+def test_wait_before_occupant_released_before_arrival_is_zero() -> None:
+    """Рекомендация п.1: занявшая освободит раньше приезда — ожидание 0, не отрицательное."""
+    assert wait_before(_s1_queue(_occupant_entry(T1, NOW + 50)), NOW + 90, CANDIDATE) == 0
+
+
+def test_wait_before_occupant_released_exactly_at_arrival_is_zero() -> None:
+    """Рекомендация п.1: освобождение ровно в момент приезда — ожидание 0."""
+    assert wait_before(_s1_queue(_occupant_entry(T1, NOW + 90)), NOW + 90, CANDIDATE) == 0
+
+
+def test_wait_before_occupant_counts_even_for_arrival_in_past() -> None:
+    """Рекомендация п.1: занявшая «приехала раньше» любого приезда, даже eta < now."""
+    assert wait_before(_s1_queue(_occupant_entry(T1, NOW + 100)), NOW - 20, CANDIDATE) == 120
+
+
+def test_wait_before_entry_with_equal_eta_and_greater_id_not_counted() -> None:
+    """Рекомендация п.1: тот же eta и больший unit_id — обслуживается позже, не учитывается."""
+    queue = _s1_queue(QueueEntry(T2, NOW + 90, NOW + 90, NOW + 90 + OCC, 0))
+    assert wait_before(queue, NOW + 90, CANDIDATE) == 0
+
+
+def test_wait_before_own_entry_not_counted() -> None:
+    """Рекомендация п.1: запись самой машины в её очереди на её ожидание не влияет."""
+    queue = _s1_queue(QueueEntry(T2, NOW + 90, NOW + 90, NOW + 90 + OCC, 0))
+    assert wait_before(queue, NOW + 90, T2) == 0
+
+
+def test_wait_before_entry_with_equal_eta_and_smaller_id_counted() -> None:
+    """Равный eta: schedule обслуживает по (eta, unit_id) — машина с меньшим id впереди.
+
+    T4 приезжает одновременно с T2, но в расписании стоит после неё: ждёт всё её обслуживание.
+    """
+    queue = _s1_queue(QueueEntry(T2, NOW + 90, NOW + 90, NOW + 90 + OCC, 0))
+    assert wait_before(queue, NOW + 90, T4) == OCC
+
+
+def test_wait_before_matches_schedule_for_equal_etas() -> None:
+    """Ожидание по wait_before совпадает с wait_seconds в расписании при одинаковых eta."""
+    entries = schedule([(T2, NOW + 90), (T3, NOW + 90), (T4, NOW + 90)], None, SITE.rules)
+    queue = _s1_queue(*entries)
+    for entry in entries:
+        assert entry.eta is not None
+        assert wait_before(queue, entry.eta, entry.unit_id) == entry.wait_seconds
+
+
+def test_wait_before_entry_one_second_earlier_counted() -> None:
+    """Рекомендация п.1: запись с eta на 1 с раньше — учитывается: ждать до её free_at."""
+    queue = _s1_queue(QueueEntry(T2, NOW + 89, NOW + 89, NOW + 89 + OCC, 0))
+    assert wait_before(queue, NOW + 90, CANDIDATE) == OCC - 1
+
+
+def test_wait_before_later_entries_not_counted() -> None:
+    """Рекомендация п.1: машины, приезжающие позже, на ожидание не влияют."""
+    queue = _s1_queue(
+        _occupant_entry(T1, NOW + 100),
+        QueueEntry(T2, NOW + 120, NOW + 120, NOW + 120 + OCC, 0),
+    )
+    assert wait_before(queue, NOW + 110, CANDIDATE) == 0
+    assert wait_before(queue, NOW + 90, CANDIDATE) == 10
+
+
+def test_wait_before_takes_release_of_last_earlier_entry() -> None:
+    """Рекомендация п.1: освобождение — free_at последней из приезжающих раньше (максимум).
+
+    Очередь: T1 занята до NOW+50, T2 приезд NOW+30 → обслуживание NOW+50..NOW+280,
+    T3 приезд NOW+60 → NOW+280..NOW+510, T4 приезд NOW+600. Машина с приездом NOW+100
+    ждёт после T3: 510 - 100 = 410; с приездом NOW+61 — тоже после T3: 510 - 61.
+    """
+    queue = _s1_queue(
+        _occupant_entry(T1, NOW + 50),
+        QueueEntry(T2, NOW + 30, NOW + 50, NOW + 50 + OCC, 20),
+        QueueEntry(T3, NOW + 60, NOW + 50 + OCC, NOW + 50 + 2 * OCC, OCC - 10),
+        QueueEntry(T4, NOW + 600, NOW + 600, NOW + 600 + OCC, 0),
+    )
+    assert wait_before(queue, NOW + 100, CANDIDATE) == 50 + 2 * OCC - 100
+    assert wait_before(queue, NOW + 61, CANDIDATE) == 50 + 2 * OCC - 61
+    assert wait_before(queue, NOW + 60, CANDIDATE) == 50 + OCC - 60
+    assert wait_before(queue, NOW + 40, CANDIDATE) == 50 + OCC - 40
+    assert wait_before(queue, NOW + 30, CANDIDATE) == 50 - 30
+    assert wait_before(queue, NOW + 600, CANDIDATE) == 0
+    assert wait_before(queue, NOW + 601, CANDIDATE) == 0 + OCC - 1
+
+
+def test_wait_before_never_negative() -> None:
+    """Рекомендация п.1: «но не меньше нуля» — поздний приезд к давно освободившейся станции."""
+    queue = _s1_queue(
+        _occupant_entry(T1, NOW + 10),
+        QueueEntry(T2, NOW + 20, NOW + 20, NOW + 20 + OCC, 0),
+    )
+    assert wait_before(queue, NOW + 1_000, CANDIDATE) == 0
+
+
+def test_wait_before_own_entry_in_built_queue_does_not_change_wait() -> None:
+    """Рекомендация п.1: своя запись в очереди не меняет ожидание (= её wait_seconds).
+
+    Согласованный случай: занявшая ещё занимает станцию и стоит в очереди первой. Очередь
+    строится вместе с самой машиной T4; ожидание по wait_before совпадает с wait_seconds её
+    записи и с ожиданием по очереди без неё.
+    """
+    occ = _busy_s1(T1, NOW - 60)
+    t4 = _track(T4, north_of(S1_POINT, 900.0))
+    others = [_waiting_at_s1(T1, NOW - 60), _track(T2, north_of(S1_POINT, 1200.0))]
+    with_t4 = build_station_queue(occ, [*others, t4], SITE, NOW)
+    without_t4 = build_station_queue(occ, others, SITE, NOW)
+    eta = estimate_arrival(t4, S1, occ, SITE, NOW)
+    assert eta == NOW + 90
+
+    own = next(e for e in with_t4.entries if e.unit_id == T4)
+    assert wait_before(with_t4, eta, T4) == wait_before(without_t4, eta, T4) == own.wait_seconds
+    assert own.wait_seconds == NOW - 60 + OCC - (NOW + 90)
+
+
+def test_wait_before_past_release_not_counted_for_waiter_in_radius() -> None:
+    """Рекомендация п.1: прошлое освобождение станции в ожидании не учитывается.
+
+    S1 освободилась по времени в NOW-10 (занявшая отстояла, в очереди её нет). T2 ждёт в
+    радиусе с NOW-100: в очереди её wait_seconds = 90 (начало с прежнего free_at), но
+    wait_before считает только записи очереди — раньше T2 никто не приедет → ожидание 0.
+    """
+    occupied_at = NOW - OCC - 10
+    occ = _busy_s1(T1, occupied_at)
+    t2 = _waiting_at_s1(T2, NOW - 100, last_ts=NOW - 11)
+    queue = build_station_queue(occ, [_waiting_at_s1(T1, occupied_at), t2], SITE, NOW)
+    eta = estimate_arrival(t2, S1, occ, SITE, NOW)
+    assert eta == NOW - 100
+    assert queue.entries[0].wait_seconds == 90
+    assert wait_before(queue, eta, T2) == 0

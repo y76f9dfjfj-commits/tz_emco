@@ -89,6 +89,21 @@ def test_rules_speed_mps_converts_kmh() -> None:
     assert Rules(speed_kmh=72.0).speed_mps == pytest.approx(20.0)
 
 
+@pytest.mark.parametrize(("age", "fresh"), [(0, True), (29, True), (30, True), (31, False)])
+def test_rules_is_fresh_default_threshold_30_inclusive(age: int, fresh: bool) -> None:
+    """Свежесть (ТЗ, «Коды отказа», очередь п.5): старше «сейчас» больше чем на 30 с — нет."""
+    now = 1_789_473_600
+    assert Rules().is_fresh(now - age, now) is fresh
+
+
+def test_rules_is_fresh_uses_configured_threshold() -> None:
+    """Порог свежести берётся из freshness_seconds (10 с: 10 — свежая, 11 — нет)."""
+    now = 1_789_473_600
+    rules = Rules(freshness_seconds=10)
+    assert rules.is_fresh(now - 10, now)
+    assert not rules.is_fresh(now - 11, now)
+
+
 @pytest.mark.parametrize("field", RULE_FIELDS)
 @pytest.mark.parametrize("value", [0, -1, True, math.inf, math.nan], ids=repr)
 def test_rules_invalid_value_raises_value_error(field: str, value: Any) -> None:
@@ -96,6 +111,17 @@ def test_rules_invalid_value_raises_value_error(field: str, value: Any) -> None:
     kwargs: dict[str, Any] = {field: value}
     with pytest.raises(ValueError):
         Rules(**kwargs)
+
+
+def test_rules_decision_radius_beyond_horizon_raises_value_error() -> None:
+    """Своя станция в точке решения вне горизонта: 1500 м при 10 м/с — 150 с > 120 с."""
+    with pytest.raises(ValueError, match="горизонта"):
+        Rules(horizon_seconds=120)
+
+
+def test_rules_decision_radius_exactly_at_horizon_allowed() -> None:
+    """Граница: путь от радиуса решения ровно равен горизонту — допустимо."""
+    assert Rules(horizon_seconds=150).horizon_seconds == 150
 
 
 # --- Point / неизменяемость ------------------------------------------------

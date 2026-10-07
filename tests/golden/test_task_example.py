@@ -18,7 +18,8 @@
 у S2 — 0 с (приезд 12:04:00) → направить T4 к S2, выигрыш 80 с.
 
 Файл разбит на разделы по этапам расчёта: занятие станции (T1), очередь, решение.
-Сейчас покрыты разделы «Занятие станции» и «Очередь».
+Для раздела «Решение» построена отдельная площадка (S1 и S2 в 3300 м к югу от S1), где
+T4 в 900 м от S1 и 2400 м от S2; T1–T3 и очередь к S1 на ней те же, что в таблице ТЗ.
 """
 
 from __future__ import annotations
@@ -26,11 +27,20 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Final
 
+import pytest
+
 from tests.sitekit import FAR_POINT, S1_ID, S1_POINT, UNIT_ID, SiteRun, make_site, north_of, tm
 from vqueue.domain.geo import distance_m
-from vqueue.domain.model import Telemetry, UnitPhase
+from vqueue.domain.model import SiteConfig, Station, Telemetry, UnitPhase
 from vqueue.domain.occupancy import Occupant, StationOccupancy
-from vqueue.domain.queue import QueueEntry, StationQueue, build_station_queue
+from vqueue.domain.queue import (
+    QueueEntry,
+    StationQueue,
+    build_station_queue,
+    estimate_arrival,
+    wait_before,
+)
+from vqueue.domain.recommendation import Recommendation, is_decision_point, recommend
 from vqueue.domain.unit_fsm import UnitTrack
 
 # ---------------------------------------------------------------------------
@@ -241,5 +251,133 @@ def test_example_queue_stale_occupant_stays_first() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Решение для T4 (ТЗ, «Рекомендация») — будет добавлено на этапе рекомендации.
+# Решение для T4 (ТЗ, «Рекомендация», «Коды отказа»)
 # ---------------------------------------------------------------------------
+
+T4: Final = "T4"
+
+DECISION_S2_ID: Final = "S2"
+DECISION_S2_POINT: Final = north_of(S1_POINT, -3_300.0)
+"""S2 площадки примера решения: в 3300 м к югу от S1."""
+
+T4_POSITION: Final = north_of(S1_POINT, -900.0)
+"""T4 в 900 м к югу от S1, т.е. в 2400 м к северу от S2."""
+
+DECISION_SITE: Final = SiteConfig(
+    stations=(Station(S1_ID, S1_POINT), Station(DECISION_S2_ID, DECISION_S2_POINT)),
+    unload_point=north_of(S1_POINT, -8_000.0),
+    assignments={T1: S1_ID, T2: S1_ID, T3: S1_ID, T4: S1_ID},
+)
+"""Площадка примера решения: S1, S2 и точка разгрузки далеко от всех машин; все за S1."""
+
+T4_ETA_S1: Final = NOW + 90
+"""12:01:30 — 900 м / 10 м/с."""
+
+T4_ETA_S2: Final = NOW + 240
+"""12:04:00 — 2400 м / 10 м/с."""
+
+
+def _decision_run() -> SiteRun:
+    """Прогоняет телеметрию примера на площадке решения: T1–T3 как в разделе «Очередь», T4."""
+    run = SiteRun(DECISION_SITE)
+    run.feed_all(
+        [
+            tm(T1_OCCUPIED_AT, T1_POSITION, 0.0),
+            tm(NOW, north_of(S1_POINT, 1_200.0), 36.0, unit_id=T2),
+            tm(NOW, north_of(S1_POINT, 3_000.0), 36.0, unit_id=T3),
+            tm(NOW, T4_POSITION, 36.0, unit_id=T4),
+            tm(NOW, T1_POSITION, 0.0),
+        ]
+    )
+    return run
+
+
+def _decision_queues(run: SiteRun, *, include_t4: bool) -> dict[str, StationQueue]:
+    """Очереди S1 и S2 на 12:00:00: к S1 едут T2, T3 (и T4 — если include_t4); к S2 никто."""
+    to_s1 = [run.tracks[u] for u in (T1, T2, T3)]
+    if include_t4:
+        to_s1.append(run.tracks[T4])
+    return {
+        S1_ID: build_station_queue(run.occupancy[S1_ID], to_s1, DECISION_SITE, NOW),
+        DECISION_S2_ID: build_station_queue(run.occupancy[DECISION_S2_ID], [], DECISION_SITE, NOW),
+    }
+
+
+def test_example_decision_geometry_900m_to_s1_2400m_to_s2() -> None:
+    """Пример ТЗ: T4 в 900 м от S1 и в 2400 м от S2; T2, T3 вне радиусов станций."""
+    assert round(distance_m(T4_POSITION, S1_POINT), 3) == 900.0
+    assert round(distance_m(T4_POSITION, DECISION_S2_POINT), 3) == 2400.0
+    assert distance_m(north_of(S1_POINT, 1_200.0), DECISION_S2_POINT) > 1_500.0
+
+
+def test_example_decision_site_keeps_s1_queue_of_task_table() -> None:
+    """Пример ТЗ: на площадке решения очередь к S1 без T4 совпадает с таблицей ТЗ."""
+    run = _decision_run()
+    assert _decision_queues(run, include_t4=False)[S1_ID] == _example_queue()
+
+
+def test_example_t4_is_at_decision_point() -> None:
+    """Пример ТЗ: T4 едет к своей S1 и ближе 1500 м к ней — момент расчёта рекомендации."""
+    run = _decision_run()
+    track = run.tracks[T4]
+    assert track.phase is UnitPhase.TO_STATION
+    assert is_decision_point(track, DECISION_SITE.station(S1_ID), DECISION_SITE.rules)
+
+
+def test_example_t4_eta_and_wait_at_s1_is_80() -> None:
+    """Пример ТЗ: приезд T4 к S1 в 12:01:30, освобождение после T1 в 12:02:50 → 80 с.
+
+    T2 приедет в 12:02:00 — позже T4 — и на ожидание T4 не влияет.
+    """
+    run = _decision_run()
+    queue = _decision_queues(run, include_t4=False)[S1_ID]
+    eta = estimate_arrival(
+        run.tracks[T4], DECISION_SITE.station(S1_ID), run.occupancy[S1_ID], DECISION_SITE, NOW
+    )
+    assert eta == T4_ETA_S1
+    assert _iso(eta) == "2026-09-15T12:01:30Z"
+    assert wait_before(queue, eta, T4) == 80
+
+
+def test_example_t4_wait_at_s1_same_with_t4_in_queue() -> None:
+    """Пример ТЗ: в своей очереди T4 стоит второй (12:01:30, ждёт 80) — wait_before тот же."""
+    run = _decision_run()
+    queue = _decision_queues(run, include_t4=True)[S1_ID]
+    own = next(e for e in queue.entries if e.unit_id == T4)
+    assert own == QueueEntry(T4, T4_ETA_S1, T1_FREE_AT, T1_FREE_AT + 230, 80)
+    assert wait_before(queue, T4_ETA_S1, T4) == 80
+
+
+def test_example_t4_eta_and_wait_at_s2_is_0() -> None:
+    """Пример ТЗ: приезд T4 к S2 в 12:04:00, очереди у S2 нет → ожидание 0."""
+    run = _decision_run()
+    queue = _decision_queues(run, include_t4=False)[DECISION_S2_ID]
+    eta = estimate_arrival(
+        run.tracks[T4],
+        DECISION_SITE.station(DECISION_S2_ID),
+        run.occupancy[DECISION_S2_ID],
+        DECISION_SITE,
+        NOW,
+    )
+    assert queue.entries == ()
+    assert eta == T4_ETA_S2
+    assert _iso(eta) == "2026-09-15T12:04:00Z"
+    assert wait_before(queue, eta, T4) == 0
+
+
+@pytest.mark.parametrize("include_t4", [False, True])
+def test_example_decision_recommends_s2_with_gain_80(include_t4: bool) -> None:
+    """Пример ТЗ, decision.v1: T4, 12:00:00, from S1, to S2, gain_seconds 80.
+
+    Результат одинаков, есть ли T4 в очереди своей S1 или нет.
+    """
+    run = _decision_run()
+    decision = recommend(
+        run.tracks[T4],
+        _decision_queues(run, include_t4=include_t4),
+        run.occupancy,
+        DECISION_SITE,
+        NOW,
+    )
+    assert decision == Recommendation(T4, NOW, S1_ID, DECISION_S2_ID, 80)
+    assert _iso(decision.at) == "2026-09-15T12:00:00Z"

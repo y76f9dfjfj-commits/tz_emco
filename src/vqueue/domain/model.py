@@ -77,10 +77,14 @@ class Rules:
     min_gain_seconds: int = 60
 
     def __post_init__(self) -> None:
-        """Проверяет, что все константы — конечные положительные числа.
+        """Проверяет, что все константы — конечные положительные числа и согласованы.
+
+        Своя станция в точке решения обязана попадать в горизонт очереди: иначе
+        расчёт рекомендации невозможен (recommend считает это ошибкой вызывающего).
 
         Raises:
-            ValueError: Константа не число (в т.ч. bool), не конечна или не больше нуля.
+            ValueError: Константа не число (в т.ч. bool), не конечна или не больше нуля;
+                путь от границы радиуса решения до станции дольше горизонта.
         """
         for f in fields(self):
             value = getattr(self, f.name)
@@ -89,6 +93,11 @@ class Rules:
                 raise ValueError(
                     f"Rules.{f.name} должно быть конечным числом > 0, получено {value!r}"
                 )
+        if self.decision_radius_m / self.speed_mps > self.horizon_seconds:
+            raise ValueError(
+                f"Путь от радиуса решения {self.decision_radius_m} м при {self.speed_kmh} км/ч "
+                f"дольше горизонта {self.horizon_seconds} с"
+            )
 
     @property
     def occupancy_seconds(self) -> int:
@@ -99,6 +108,18 @@ class Rules:
     def speed_mps(self) -> float:
         """Расчётная скорость в м/с."""
         return self.speed_kmh * 1000.0 / 3600.0
+
+    def is_fresh(self, last_ts: int, now: int) -> bool:
+        """Проверяет, что позиция или сообщение не старше порога свежести.
+
+        Args:
+            last_ts: Время позиции (сообщения), секунды epoch.
+            now: «Сейчас», секунды epoch.
+
+        Returns:
+            True, если now - last_ts не больше freshness_seconds (ровно порог — ещё свежая).
+        """
+        return now - last_ts <= self.freshness_seconds
 
 
 @dataclass(frozen=True, slots=True)

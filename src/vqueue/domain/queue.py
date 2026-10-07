@@ -89,7 +89,7 @@ def estimate_arrival(
     if occ.is_busy(now) and occupant is not None and occupant.unit_id == track.unit_id:
         # Занявшая станцию стоит в очереди отдельно, первой.
         return None
-    if now - track.last_ts > rules.freshness_seconds:
+    if not rules.is_fresh(track.last_ts, now):
         return None
 
     entry = track.zone_entry
@@ -198,3 +198,31 @@ def build_station_queue(
         at=now,
         entries=head + schedule(arrivals, free_from, site.rules),
     )
+
+
+def wait_before(queue: StationQueue, eta: int, unit_id: str) -> int:
+    """Оценивает ожидание машины, приезжающей к станции в момент eta.
+
+    Станция освободится по free_at последней из машин, приезжающих раньше:
+    занявшая станцию (eta None) всегда раньше, остальные — в порядке schedule,
+    по (eta, unit_id). При равном eta раньше обслуживается машина с меньшим
+    unit_id — иначе ожидание расходилось бы с расписанием очереди. Запись самой
+    машины строгим сравнением не учитывается, а на расписание приезжающих раньше
+    она не влияет, поэтому очередь передаётся как есть.
+
+    Args:
+        queue: Очередь станции.
+        eta: Момент приезда машины к станции.
+        unit_id: Идентификатор машины — порядок при равном eta.
+
+    Returns:
+        Ожидание в секундах, не меньше нуля; 0, если станция свободна.
+    """
+    free_moments = [
+        entry.free_at
+        for entry in queue.entries
+        if entry.eta is None or (entry.eta, entry.unit_id) < (eta, unit_id)
+    ]
+    if not free_moments:
+        return 0
+    return max(0, max(free_moments) - eta)
