@@ -18,7 +18,7 @@
 у S2 — 0 с (приезд 12:04:00) → направить T4 к S2, выигрыш 80 с.
 
 Файл разбит на разделы по этапам расчёта: занятие станции (T1), очередь, решение.
-Сейчас покрыт раздел «Занятие станции».
+Сейчас покрыты разделы «Занятие станции» и «Очередь».
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from tests.sitekit import FAR_POINT, S1_ID, S1_POINT, UNIT_ID, SiteRun, make_sit
 from vqueue.domain.geo import distance_m
 from vqueue.domain.model import Telemetry, UnitPhase
 from vqueue.domain.occupancy import Occupant, StationOccupancy
+from vqueue.domain.queue import QueueEntry, StationQueue, build_station_queue
 from vqueue.domain.unit_fsm import UnitTrack
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,9 @@ SITE: Final = make_site()
 
 T1: Final = UNIT_ID
 """В sitekit машина T1 закреплена за S1 — как в примере."""
+
+NOW: Final = 1_789_473_600
+"""2026-09-15T12:00:00Z — момент расчёта примера."""
 
 T1_OCCUPIED_AT: Final = 1_789_473_540
 """2026-09-15T11:59:00Z — первое сообщение T1 «стоит в 15 м от S1»."""
@@ -120,23 +124,121 @@ def test_example_t1_after_approach_occupies_at_first_stopped_message() -> None:
 
 def test_example_s1_busy_at_calculation_moment_12_00_00() -> None:
     """Пример ТЗ: в момент расчёта 12:00:00 станция S1 занята T1, в 12:02:50 — свободна."""
-    calc_moment = T1_OCCUPIED_AT + 60  # 12:00:00
     _, occ = _replay(
         [
             tm(T1_OCCUPIED_AT, T1_POSITION, 0.0),
-            tm(calc_moment, T1_POSITION, 0.0),
+            tm(NOW, T1_POSITION, 0.0),
         ]
     )
 
-    assert _iso(calc_moment) == "2026-09-15T12:00:00Z"
-    assert occ.is_busy(calc_moment)
+    assert _iso(NOW) == "2026-09-15T12:00:00Z"
+    assert occ.is_busy(NOW)
     assert occ.is_busy(T1_FREE_AT - 1)
     assert not occ.is_busy(T1_FREE_AT)
 
 
 # ---------------------------------------------------------------------------
-# Очередь (ТЗ, «Очередь») — будет добавлено на этапе очереди.
+# Очередь (ТЗ, «Очередь», правила 1–3)
 # ---------------------------------------------------------------------------
+
+T2: Final = "T2"
+T3: Final = "T3"
+
+
+def _example_queue() -> StationQueue:
+    """Прогоняет телеметрию примера и строит очередь к S1 на 12:00:00.
+
+    T1 стоит в 15 м от S1 с 11:59:00 (и в 12:00:00); T2 и T3 едут к S1 из 1200 м и 3000 м,
+    их позиции — в 12:00:00.
+    """
+    run = SiteRun(SITE)
+    run.feed_all(
+        [
+            tm(T1_OCCUPIED_AT, T1_POSITION, 0.0),
+            tm(NOW, north_of(S1_POINT, 1_200.0), 36.0, unit_id=T2),
+            tm(NOW, north_of(S1_POINT, 3_000.0), 36.0, unit_id=T3),
+            tm(NOW, T1_POSITION, 0.0),
+        ]
+    )
+    assert run.tracks[T2].phase is UnitPhase.TO_STATION
+    assert run.tracks[T3].phase is UnitPhase.TO_STATION
+    return build_station_queue(run.occupancy[S1_ID], run.tracks.values(), SITE, NOW)
+
+
+def test_example_queue_s1_matches_task_table() -> None:
+    """Пример ТЗ, таблица «Очередь к S1»: T1 (занявшая), T2 ждёт 50 с, T3 ждёт 100 с."""
+    queue = _example_queue()
+
+    assert queue == StationQueue(
+        S1_ID,
+        NOW,
+        (
+            QueueEntry(T1, None, T1_OCCUPIED_AT, T1_FREE_AT, 0),
+            QueueEntry(T2, NOW + 120, T1_FREE_AT, T1_FREE_AT + 230, 50),
+            QueueEntry(T3, NOW + 300, T1_FREE_AT + 230, T1_FREE_AT + 460, 100),
+        ),
+    )
+
+
+def test_example_queue_s1_times_in_iso() -> None:
+    """Пример ТЗ: времена очереди к S1 совпадают с таблицей ТЗ в ISO 8601 UTC."""
+    queue = _example_queue()
+
+    rows = [
+        (
+            e.unit_id,
+            None if e.eta is None else _iso(e.eta),
+            _iso(e.service_start),
+            _iso(e.free_at),
+            e.wait_seconds,
+        )
+        for e in queue.entries
+    ]
+    assert _iso(queue.at) == "2026-09-15T12:00:00Z"
+    assert rows == [
+        ("T1", None, "2026-09-15T11:59:00Z", "2026-09-15T12:02:50Z", 0),
+        ("T2", "2026-09-15T12:02:00Z", "2026-09-15T12:02:50Z", "2026-09-15T12:06:40Z", 50),
+        ("T3", "2026-09-15T12:05:00Z", "2026-09-15T12:06:40Z", "2026-09-15T12:10:30Z", 100),
+    ]
+
+
+def test_example_queue_independent_of_tracks_order() -> None:
+    """Пример ТЗ, п.2: очередь к S1 не зависит от порядка, в котором переданы треки."""
+    run = SiteRun(SITE)
+    run.feed_all(
+        [
+            tm(T1_OCCUPIED_AT, T1_POSITION, 0.0),
+            tm(NOW, north_of(S1_POINT, 3_000.0), 36.0, unit_id=T3),
+            tm(NOW, north_of(S1_POINT, 1_200.0), 36.0, unit_id=T2),
+            tm(NOW, T1_POSITION, 0.0),
+        ]
+    )
+    tracks = list(run.tracks.values())
+    forward = build_station_queue(run.occupancy[S1_ID], tracks, SITE, NOW)
+    backward = build_station_queue(run.occupancy[S1_ID], reversed(tracks), SITE, NOW)
+
+    assert forward == backward == _example_queue()
+
+
+def test_example_queue_stale_occupant_stays_first() -> None:
+    """Пример ТЗ, п.5: T1 молчит с 11:59:00 (позиция старше 30 с) — всё равно первая.
+
+    Правило свежести не касается машины, занявшей станцию: очередь та же, что в таблице ТЗ.
+    """
+    run = SiteRun(SITE)
+    run.feed_all(
+        [
+            tm(T1_OCCUPIED_AT, T1_POSITION, 0.0),
+            tm(NOW, north_of(S1_POINT, 1_200.0), 36.0, unit_id=T2),
+            tm(NOW, north_of(S1_POINT, 3_000.0), 36.0, unit_id=T3),
+        ]
+    )
+    assert NOW - run.tracks[T1].last_ts > SITE.rules.freshness_seconds
+
+    queue = build_station_queue(run.occupancy[S1_ID], run.tracks.values(), SITE, NOW)
+
+    assert queue == _example_queue()
+
 
 # ---------------------------------------------------------------------------
 # Решение для T4 (ТЗ, «Рекомендация») — будет добавлено на этапе рекомендации.
