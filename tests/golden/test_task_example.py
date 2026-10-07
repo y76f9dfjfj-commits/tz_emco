@@ -17,7 +17,8 @@
 у S2 очереди нет). Ожидание у S1 — 80 с (приезд 12:01:30, освобождение 12:02:50 после T1),
 у S2 — 0 с (приезд 12:04:00) → направить T4 к S2, выигрыш 80 с.
 
-Файл разбит на разделы по этапам расчёта: занятие станции (T1), очередь, решение.
+Файл разбит на разделы по этапам расчёта: занятие станции (T1), очередь, решение,
+сквозной прогон всего примера через агрегат площадки SiteState.
 Для раздела «Решение» построена отдельная площадка (S1 и S2 в 3300 м к югу от S1), где
 T4 в 900 м от S1 и 2400 м от S2; T1–T3 и очередь к S1 на ней те же, что в таблице ТЗ.
 """
@@ -40,7 +41,14 @@ from vqueue.domain.queue import (
     estimate_arrival,
     wait_before,
 )
-from vqueue.domain.recommendation import Recommendation, is_decision_point, recommend
+from vqueue.domain.recommendation import (
+    Recommendation,
+    Rejection,
+    RejectReason,
+    is_decision_point,
+    recommend,
+)
+from vqueue.domain.site import SiteOutput, SiteState
 from vqueue.domain.unit_fsm import UnitTrack
 
 # ---------------------------------------------------------------------------
@@ -381,3 +389,106 @@ def test_example_decision_recommends_s2_with_gain_80(include_t4: bool) -> None:
     )
     assert decision == Recommendation(T4, NOW, S1_ID, DECISION_S2_ID, 80)
     assert _iso(decision.at) == "2026-09-15T12:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# Сквозной пример: весь поток телеметрии примера через агрегат площадки
+# (ТЗ, «Пример», «Публикация», «Рекомендация» п.4)
+# ---------------------------------------------------------------------------
+
+_T1_EVERY_SECOND: Final = [tm(ts, T1_POSITION, 0.0) for ts in range(T1_OCCUPIED_AT, NOW + 1)]
+"""T1 стоит в 15 м от S1 и передаёт позицию каждую секунду с 11:59:00 по 12:00:00."""
+
+_T1_TWO_MESSAGES: Final = [tm(T1_OCCUPIED_AT, T1_POSITION, 0.0), tm(NOW, T1_POSITION, 0.0)]
+"""T1 стоит в 15 м от S1: сообщения только в 11:59:00 и 12:00:00."""
+
+
+def _end_to_end(t1_messages: list[Telemetry]) -> list[SiteOutput]:
+    """Прогоняет поток примера через SiteState: T1, затем T2, T3, T4 в 12:00:00."""
+    state = SiteState(DECISION_SITE)
+    stream = [
+        *t1_messages,
+        tm(NOW, north_of(S1_POINT, 1_200.0), 36.0, unit_id=T2),
+        tm(NOW, north_of(S1_POINT, 3_000.0), 36.0, unit_id=T3),
+        tm(NOW, T4_POSITION, 36.0, unit_id=T4),
+    ]
+    outputs: list[SiteOutput] = []
+    for msg in stream:
+        outputs.extend(state.apply(msg))
+    assert state.now == NOW
+    return outputs
+
+
+_T1_STREAMS: Final = pytest.mark.parametrize(
+    "t1_messages",
+    [
+        pytest.param(_T1_EVERY_SECOND, id="t1-every-second"),
+        pytest.param(_T1_TWO_MESSAGES, id="t1-two-messages"),
+    ],
+)
+
+
+@_T1_STREAMS
+def test_end_to_end_t4_recommended_to_s2_with_gain_80(t1_messages: list[Telemetry]) -> None:
+    """Пример ТЗ, decision.v1 для T4: рекомендация S1 → S2 в 12:00:00, выигрыш 80 с.
+
+    Первое сообщение T4 уже ближе 1500 м к S1 в состоянии «к станции» — решение сразу.
+    """
+    outputs = _end_to_end(t1_messages)
+
+    t4_decisions = [
+        o for o in outputs if isinstance(o, Recommendation | Rejection) and o.unit_id == T4
+    ]
+    assert t4_decisions == [Recommendation(T4, NOW, S1_ID, DECISION_S2_ID, 80)]
+    assert _iso(t4_decisions[0].at) == "2026-09-15T12:00:00Z"
+
+
+@_T1_STREAMS
+def test_end_to_end_other_decisions_only_t2_no_gain(t1_messages: list[Telemetry]) -> None:
+    """Пример ТЗ: T2 в 1200 м от S1 тоже в точке решения — отказ no_gain (выигрыш 50 < 60).
+
+    T2 у S1 ждёт 50 с, у S2 (4500 м) — 0 с; T3 в 3000 м и T1 на станции решений не получают.
+    """
+    outputs = _end_to_end(t1_messages)
+
+    decisions = [o for o in outputs if isinstance(o, Recommendation | Rejection)]
+    assert decisions == [
+        Rejection(T2, NOW, RejectReason.NO_GAIN),
+        Recommendation(T4, NOW, S1_ID, DECISION_S2_ID, 80),
+    ]
+
+
+@_T1_STREAMS
+def test_end_to_end_published_queues_match_task(t1_messages: list[Telemetry]) -> None:
+    """Пример ТЗ: итоговая очередь S1 — таблица ТЗ без T4; очередь S2 — только T4.
+
+    После рекомендации T4 считается едущей к S2: приезд 12:04:00, начало 12:04:00,
+    освобождение 12:07:50, ожидание 0.
+    """
+    outputs = _end_to_end(t1_messages)
+
+    last = {o.station_id: o for o in outputs if isinstance(o, StationQueue)}
+    assert last[S1_ID] == _example_queue()
+    assert last[DECISION_S2_ID] == StationQueue(
+        DECISION_S2_ID, NOW, (QueueEntry(T4, T4_ETA_S2, T4_ETA_S2, T4_ETA_S2 + 230, 0),)
+    )
+    assert _iso(T4_ETA_S2 + 230) == "2026-09-15T12:07:50Z"
+
+
+@_T1_STREAMS
+def test_end_to_end_consecutive_queues_differ(t1_messages: list[Telemetry]) -> None:
+    """ТЗ «Публикация»: подряд опубликованные очереди одной станции различаются.
+
+    T1, стоящая каждую секунду на месте, не порождает повторных публикаций очереди S1.
+    Очередь S1 публикуется ровно 3 раза: занятие T1 (11:59:00), добавление T2 и добавление T3
+    (12:00:00). Рекомендация T4 очередь S1 не меняет: T4 сразу считается едущей к S2.
+    """
+    outputs = _end_to_end(t1_messages)
+
+    published: dict[str, tuple[QueueEntry, ...]] = {}
+    for o in outputs:
+        if isinstance(o, StationQueue):
+            assert o.entries != published.get(o.station_id, ())
+            published[o.station_id] = o.entries
+    s1_count = sum(1 for o in outputs if isinstance(o, StationQueue) and o.station_id == S1_ID)
+    assert s1_count == 3
