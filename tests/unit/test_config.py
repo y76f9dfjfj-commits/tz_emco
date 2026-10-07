@@ -143,10 +143,10 @@ def test_site_toml_has_four_stations(site: SiteConfig) -> None:
     assert len(set(ids)) == 4
 
 
-def test_site_toml_has_forty_units_ten_per_station(site: SiteConfig) -> None:
-    """40 машин, каждая закреплена за станцией, по 10 на станцию."""
+def test_site_toml_has_forty_units_with_uneven_load(site: SiteConfig) -> None:
+    """40 машин (ТЗ), закрепление 13/10/9/8: неравномерная нагрузка — рекомендации имеют смысл."""
     assert len(site.assignments) == 40
-    assert Counter(site.assignments.values()) == Counter({s.station_id: 10 for s in site.stations})
+    assert Counter(site.assignments.values()) == Counter({"S1": 13, "S2": 10, "S3": 9, "S4": 8})
 
 
 def test_site_toml_rules_match_task_constants(site: SiteConfig) -> None:
