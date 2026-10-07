@@ -90,7 +90,9 @@ class Settings:
         kafka_bootstrap: Адреса брокеров Kafka.
         site_config: Путь к TOML-конфигурации площадки.
         site_id: Идентификатор площадки (ключ снимка, часть transactional.id и группы).
-        instance_id: Идентификатор экземпляра (часть transactional.id).
+        instance_id: Идентификатор экземпляра (часть transactional.id): INSTANCE_ID или имя хоста.
+        group_instance_id: group.instance.id для статического членства — только явно
+            заданный INSTANCE_ID, иначе None (динамическое членство).
         consumer_group: Консьюмер-группа процессора.
         health_port: Порт HTTP health-check.
         log_level: Уровень логирования.
@@ -100,6 +102,7 @@ class Settings:
     site_config: Path
     site_id: str
     instance_id: str
+    group_instance_id: str | None
     consumer_group: str
     health_port: int
     log_level: str
@@ -112,11 +115,13 @@ class Settings:
             ValueError: Некорректный HEALTH_PORT или LOG_LEVEL.
         """
         site_id = _env("SITE_ID", "site-1")
+        explicit_instance_id = os.environ.get("INSTANCE_ID") or None
         return cls(
             kafka_bootstrap=_env("KAFKA_BOOTSTRAP", "localhost:9092"),
             site_config=Path(_env("SITE_CONFIG", "config/site.toml")),
             site_id=site_id,
-            instance_id=_env("INSTANCE_ID", socket.gethostname()),
+            instance_id=explicit_instance_id or socket.gethostname(),
+            group_instance_id=explicit_instance_id,
             consumer_group=_env("CONSUMER_GROUP", f"vqueue-processor-{site_id}"),
             health_port=_parse_port(_env("HEALTH_PORT", "8080")),
             log_level=_parse_log_level(_env("LOG_LEVEL", "INFO")),
@@ -136,9 +141,11 @@ def main() -> None:
     _configure_logging(settings.log_level)
     site = load_site_config(settings.site_config)
     logger.info(
-        "Старт процессора: site_id=%s, instance_id=%s, станций=%d, bootstrap=%s, group=%s",
+        "Старт процессора: site_id=%s, instance_id=%s, static=%s, станций=%d, bootstrap=%s, "
+        "group=%s",
         settings.site_id,
         settings.instance_id,
+        settings.group_instance_id is not None,
         len(site.stations),
         settings.kafka_bootstrap,
         settings.consumer_group,
@@ -175,15 +182,24 @@ def main() -> None:
         finally:
             state_consumer.close()
 
-    consumer = Consumer(
-        {
-            "bootstrap.servers": settings.kafka_bootstrap,
-            "group.id": settings.consumer_group,
-            "enable.auto.commit": False,
-            "isolation.level": "read_committed",
-            "auto.offset.reset": "earliest",
-        }
-    )
+    consumer_config: dict[str, str | int | bool] = {
+        "bootstrap.servers": settings.kafka_bootstrap,
+        "group.id": settings.consumer_group,
+        "enable.auto.commit": False,
+        "isolation.level": "read_committed",
+        "auto.offset.reset": "earliest",
+    }
+    if settings.group_instance_id is not None:
+        # Статическое членство — только при явном INSTANCE_ID (имя хоста в контейнере
+        # меняется при пересоздании, и «чужой» статический член держал бы партицию). Компромисс:
+        # + перезапущенный после падения экземпляр с тем же id сразу получает свою партицию,
+        #   без rebalance и ожидания session.timeout.ms (45 с по умолчанию);
+        # - SIGTERM не освобождает партицию: статический член при close не покидает группу,
+        #   и standby с другим id получит её только по истечении session.timeout.ms;
+        # - два живых экземпляра с одним INSTANCE_ID недопустимы: они фенсят друг друга
+        #   (и в группе, и по transactional.id), поэтому docker compose --scale processor нельзя.
+        consumer_config["group.instance.id"] = settings.group_instance_id
+    consumer = Consumer(consumer_config)
     runner = KafkaRunner(
         consumer, producer, TelemetryProcessor(site, settings.site_id), health, restore
     )

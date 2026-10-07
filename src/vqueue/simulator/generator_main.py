@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import signal
@@ -23,6 +24,7 @@ from vqueue.config import load_site_config
 from vqueue.domain.model import Telemetry
 from vqueue.simulator.engine import Simulation
 from vqueue.simulator.faults import FaultInjector
+from vqueue.simulator.resume import last_ts_in_topic, start_ts
 from vqueue.simulator.wire import encode_telemetry
 
 LOG_EVERY_S: Final = 300
@@ -162,7 +164,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092"))
     parser.add_argument("--topic", default="telemetry.v1")
     parser.add_argument(
-        "--start-ts", type=int, default=None, help="Начало, секунды epoch (по умолчанию — сейчас)"
+        "--start-ts",
+        type=int,
+        default=None,
+        help="Начало, секунды epoch (по умолчанию — сейчас, но не раньше последнего ts в топике)",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -224,8 +229,16 @@ def run(argv: Sequence[str] | None = None) -> int:
         level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s"
     )
     site = load_site_config(args.site_config)
-    start_ts = int(time.time()) if args.start_ts is None else args.start_ts
-    simulation = Simulation(site, start_ts=start_ts, seed=args.seed)
+    now = int(time.time())
+    begin_ts = start_ts(
+        args.start_ts,
+        args.output,
+        now,
+        functools.partial(last_ts_in_topic, args.bootstrap, args.topic),
+    )
+    if begin_ts > now and args.start_ts is None:
+        logger.info("Продолжение времени топика %s: старт с ts=%d", args.topic, begin_ts)
+    simulation = Simulation(site, start_ts=begin_ts, seed=args.seed)
     faults = FaultInjector(seed=args.seed, dup_rate=args.dup_rate, late_rate=args.late_rate)
     stop = threading.Event()
     sink: Sink = (

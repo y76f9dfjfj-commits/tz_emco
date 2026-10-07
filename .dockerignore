@@ -1,0 +1,13 @@
+# В контекст сборки попадают только pyproject.toml, poetry.lock, README.md, src и config.
+*
+
+!pyproject.toml
+!poetry.lock
+!README.md
+!src/
+!config/
+
+# Артефакты Python внутри разрешённых каталогов.
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
