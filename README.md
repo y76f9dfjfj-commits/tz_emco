@@ -65,7 +65,7 @@ make down
 
 Процессор и генератор можно запустить и без Docker, против брокера из `make kafka-up`: `make run-processor` (health на :8081, своя группа и `SITE_ID=site-local`) и `make run-generator`. Локальный процессор читает `telemetry.v1` независимо от процессора стенда и хранит свой снимок, но публикует в те же `queue.v1` и `decision.v1`: при поднятом стенде выходы для потребителей дублируются. Параметры генератора: `poetry run python -m vqueue.simulator.generator_main --help` (ускорение, длительность, доли дублей и опозданий, `seed`, вывод в stdout).
 
-CI (GitHub Actions): pre-commit-хуки, тесты на Python 3.11/3.12/3.13, интеграционные тесты с Kafka, сборка образа под amd64/arm64 и smoke-проверка amd64-образа. По тегу `vX.Y.Z` образ публикуется в ghcr.io.
+CI (GitHub Actions): pre-commit-хуки, тесты на Python 3.11/3.12/3.13, интеграционные тесты с Kafka, сборка образа под amd64/arm64 и smoke-проверка amd64-образа. Публикация образа в ghcr.io — только вручную (Actions → Release → Run workflow на теге `vX.Y.Z`); тег сам по себе ничего не публикует.
 
 ### Переменные окружения процессора
 

@@ -1,11 +1,12 @@
-# Публикация образа при теге версии vX.Y.Z: ghcr.io/<owner>/<repo>:X.Y.Z, для стабильных
-# версий также :latest; платформы linux/amd64 и linux/arm64. Перед публикацией — полный CI
-# (тот же workflow, что на push). Аутентификация — встроенный GITHUB_TOKEN.
+# Публикация образа — только вручную: Actions → Release → Run workflow, в «Use workflow from»
+# выбрать тег версии vX.Y.Z. Тег сам по себе ничего не публикует — это метка версии.
+# Результат: ghcr.io/<owner>/<repo>:X.Y.Z, для стабильных версий также :latest; платформы
+# linux/amd64 и linux/arm64. Перед публикацией — полный CI (тот же workflow, что на push).
+# Аутентификация — встроенный GITHUB_TOKEN.
 name: Release
 
 on:
-  push:
-    tags: ["v*.*.*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
