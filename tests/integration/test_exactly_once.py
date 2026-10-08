@@ -6,6 +6,8 @@
 равен end offset) выходы decision.v1 и queue.v1, прочитанные read_committed, по каждому ключу
 совпадают с эталоном — выходами SiteState, посчитанными в памяти по тому же потоку в том же
 порядке и закодированными тем же codec: ни дублей, ни потерь, тот же порядок.
+Последний снимок в топике состояния несёт позицию чтения (заголовок telemetry-next-offset),
+равную закоммиченному офсету группы.
 """
 
 from __future__ import annotations
@@ -22,12 +24,14 @@ from tests.integration.kafkakit import (
     OffsetProbe,
     by_key,
     end_offset,
+    last_headers_by_key,
     produce_all,
     read_committed,
     wait_until,
 )
 from vqueue.adapters import topics
 from vqueue.adapters.codec import decode_telemetry, encode_decision, encode_queue
+from vqueue.adapters.kafka_runner import NEXT_OFFSET_HEADER
 from vqueue.config import load_site_config
 from vqueue.domain.queue import StationQueue
 from vqueue.domain.site import SiteState
@@ -153,3 +157,12 @@ def test_sigkill_mid_processing_restart_outputs_equal_reference_exactly_once(
 
     assert decisions == expected_decisions, _diff("decision", decisions, expected_decisions)
     assert queues == expected_queues, _diff("queue", queues, expected_queues)
+
+    state_headers = last_headers_by_key(
+        bootstrap, topics.STATE, procs.site_id, f"it-read-state-{run_id}"
+    )
+    assert state_headers is not None, "в топике состояния нет снимка площадки"
+    positions = [v for k, v in state_headers if k == NEXT_OFFSET_HEADER]
+    assert positions[-1:] == [str(end).encode("ascii")], (
+        f"позиция в последнем снимке {positions} != закоммиченному офсету группы {end}"
+    )

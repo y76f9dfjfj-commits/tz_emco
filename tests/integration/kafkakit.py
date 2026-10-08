@@ -45,8 +45,18 @@ TOPIC_PARTITIONS: Final = {
 }
 """Партиции топиков, как в kafka-init docker-compose."""
 
-TOPIC_CONFIGS: Final = {topics.STATE: {"cleanup.policy": "compact"}}
-"""Особые настройки топиков: снимок состояния — compacted."""
+TOPIC_CONFIGS: Final = {
+    topics.STATE: {
+        "cleanup.policy": "compact",
+        "segment.ms": "600000",
+        "min.cleanable.dirty.ratio": "0.1",
+    }
+}
+"""Особые настройки топиков, как в kafka-init: снимок состояния — compacted.
+
+Короткий segment.ms и низкий min.cleanable.dirty.ratio: компакция не трогает активный
+сегмент, без них при рестарте пришлось бы читать все снимки за срок хранения.
+"""
 
 
 def wait_until(
@@ -276,6 +286,52 @@ def read_committed(
         return out
     finally:
         consumer.close()
+
+
+def last_headers_by_key(
+    bootstrap: str, topic: str, key: str, group: str, timeout_s: float = 30.0
+) -> list[tuple[str, bytes | None]] | None:
+    """Заголовки последней записи с ключом key (read_committed, одна партиция 0).
+
+    Returns:
+        Заголовки последней записи ключа; None, если записей с этим ключом нет.
+
+    Raises:
+        AssertionError: Не дочитали топик до конца за timeout_s.
+    """
+    consumer = Consumer(
+        {
+            "bootstrap.servers": bootstrap,
+            "group.id": group,
+            "enable.auto.commit": False,
+            "isolation.level": "read_committed",
+            "enable.partition.eof": True,
+        }
+    )
+    try:
+        consumer.assign([TopicPartition(topic, 0, OFFSET_BEGINNING)])
+        found: list[tuple[str, bytes | None]] | None = None
+        deadline = time.monotonic() + timeout_s
+        while True:
+            assert time.monotonic() < deadline, f"Не дочитали {topic} за {timeout_s} с"
+            for msg in consumer.consume(1000, 0.5):
+                err = msg.error()
+                if err is not None:
+                    if err.code() == KafkaError._PARTITION_EOF:
+                        return found
+                    raise KafkaException(err)
+                msg_key = msg.key()
+                if msg_key is not None and msg_key.decode() == key:
+                    raw = msg.headers() or []
+                    pairs = list(raw.items()) if isinstance(raw, dict) else list(raw)
+                    found = [(str(k), _as_bytes(v)) for k, v in pairs]
+    finally:
+        consumer.close()
+
+
+def _as_bytes(value: str | bytes | None) -> bytes | None:
+    """Значение заголовка в байтах."""
+    return value.encode() if isinstance(value, str) else value
 
 
 def by_key(records: Sequence[tuple[str, str]]) -> dict[str, list[str]]:

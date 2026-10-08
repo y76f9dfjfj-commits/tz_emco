@@ -46,8 +46,9 @@ services:
       start_period: 30s
       retries: 10
 
-  # Одноразовое создание топиков; повторный запуск ничего не меняет (--if-not-exists).
-  # Число партиций существующего топика не изменяется — при смене схемы нужен make reset.
+  # Одноразовое создание топиков; повторный запуск идемпотентен: топики --if-not-exists,
+  # настройки топика состояния переприменяются kafka-configs --alter. Число партиций
+  # существующего топика не изменяется — при смене схемы нужен make reset.
   kafka-init:
     image: *kafka-image
     depends_on:
@@ -65,8 +66,16 @@ services:
         create telemetry.v1 --partitions 1
         create queue.v1 --partitions 4
         create decision.v1 --partitions 4
-        # Снимок состояния: последний по ключу site_id.
-        create vqueue.state.v1 --partitions 1 --config cleanup.policy=compact
+        # Снимок состояния: последний по ключу site_id. Компакция не трогает активный
+        # сегмент: короткий segment.ms и низкий порог грязной доли не дают копиться
+        # старым снимкам, которые иначе перечитываются при каждом восстановлении.
+        state_configs=cleanup.policy=compact,segment.ms=600000,min.cleanable.dirty.ratio=0.1
+        create vqueue.state.v1 --partitions 1 \
+          --config cleanup.policy=compact --config segment.ms=600000 \
+          --config min.cleanable.dirty.ratio=0.1
+        # Существующему топику (создан до появления настроек) — те же настройки, идемпотентно.
+        /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka:9092 --alter \
+          --entity-type topics --entity-name vqueue.state.v1 --add-config "$$state_configs"
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --exclude-internal
     restart: "no"
 
@@ -93,7 +102,8 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
-  # Тот же образ; параметры генератора переопределяются в docker-compose.override.yml.
+  # Тот же образ; параметры генератора можно переопределить в docker-compose.override.yml
+  # (Compose подхватывает его автоматически, если файл есть; в репозитории его нет).
   generator:
     build: .
     image: vqueue:local

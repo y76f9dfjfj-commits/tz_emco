@@ -1,7 +1,7 @@
 """Фейки портов Kafka для тестов транзакционного цикла без брокера.
 
-Структурно соответствуют MessagePort, ConsumerPort, ProducerPort и StateConsumerPort
-из vqueue.adapters.kafka_runner. Поведение повторяет семантику confluent_kafka:
+Структурно соответствуют MessagePort, ConsumerPort, ProducerPort, StateConsumerPort
+и WatermarkPort из vqueue.adapters.kafka_runner. Поведение повторяет семантику confluent_kafka:
 - консьюмер читает журнал сообщений по позициям партиций; seek разрешён только по
   назначенным партициям, иначе KafkaException;
 - продюсер — автомат транзакции (none / in_transaction / committing / abortable / fatal):
@@ -19,7 +19,11 @@ from enum import StrEnum
 
 from confluent_kafka import OFFSET_BEGINNING, KafkaError, KafkaException, TopicPartition
 
+from vqueue.adapters.kafka_runner import ProducedHeaders
 from vqueue.adapters.topics import STATE, TELEMETRY
+
+MessageHeaders = list[tuple[str, bytes | None]]
+"""Заголовки полученного сообщения — как их отдаёт confluent_kafka.Message.headers()."""
 
 Position = tuple[str, int, int]
 """(топик, партиция, офсет) — сравнимое представление TopicPartition."""
@@ -64,6 +68,7 @@ class FakeMessage:
     value_: bytes | None = None
     key_: bytes | None = None
     error_: KafkaError | None = None
+    headers_: MessageHeaders | None = None
 
     def error(self) -> KafkaError | None:
         """Ошибка вместо сообщения или None."""
@@ -89,6 +94,10 @@ class FakeMessage:
         """Значение."""
         return self.value_
 
+    def headers(self) -> MessageHeaders | None:
+        """Заголовки или None, если их нет."""
+        return self.headers_
+
 
 def eof(partition: int = 0, offset: int = 0, topic: str = TELEMETRY) -> FakeMessage:
     """Служебное сообщение «достигнут конец партиции»."""
@@ -108,6 +117,9 @@ class FakeConsumer:
     не меньше текущей позиции партиции, и сдвигает позиции. Если в injected есть заготовка,
     отдаётся она целиком (для ошибок и EOF). seek переставляет позицию назначенной партиции
     (назначены партиции журнала и явно перечисленные в assigned).
+    group_offsets — закоммиченные офсеты группы: с них начинается чтение партиции, если
+    позицию не переопределил assign (как в confluent_kafka при назначении партиции).
+    assign записывает вызов и ставит позицию партиции = переданному офсету.
     on_consume вызывается перед каждым consume (например, чтобы выставить stop).
     """
 
@@ -116,6 +128,8 @@ class FakeConsumer:
     injected: deque[list[FakeMessage]] = field(default_factory=deque)
     on_consume: Callable[[int], None] | None = None
     assigned: set[tuple[str, int]] = field(default_factory=set)
+    group_offsets: dict[tuple[str, int], int] = field(default_factory=dict)
+    assign_calls: list[list[Position]] = field(default_factory=list)
     group_metadata: object = field(default_factory=object)
     consume_calls: list[tuple[int, float]] = field(default_factory=list)
     seeks: list[Position] = field(default_factory=list)
@@ -123,10 +137,11 @@ class FakeConsumer:
     _positions: dict[tuple[str, int], int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Назначает партиции, встречающиеся в журнале."""
+        """Назначает партиции журнала; стартовые позиции — офсеты группы."""
         for m in self.log:
             assert m.topic_ is not None and m.partition_ is not None
             self.assigned.add((m.topic_, m.partition_))
+        self._positions.update(self.group_offsets)
 
     @staticmethod
     def _tp(msg: FakeMessage) -> tuple[str, int]:
@@ -162,6 +177,14 @@ class FakeConsumer:
             raise KafkaException(KafkaError(KafkaError._UNKNOWN_PARTITION, f"not assigned {tp}"))
         self.seeks.append((partition.topic, partition.partition, partition.offset))
         self._positions[tp] = partition.offset
+
+    def assign(self, partitions: list[TopicPartition], /) -> None:
+        """Назначает партиции; неотрицательный офсет задаёт стартовую позицию."""
+        self.assign_calls.append([(p.topic, p.partition, p.offset) for p in partitions])
+        for p in partitions:
+            self.assigned.add((p.topic, p.partition))
+            if p.offset >= 0:
+                self._positions[(p.topic, p.partition)] = p.offset
 
     def consumer_group_metadata(self) -> object:
         """Метаданные группы (непрозрачный объект)."""
@@ -200,6 +223,8 @@ class FakeProducer:
     calls: list[str] = field(default_factory=list)
     pending: list[Produced] = field(default_factory=list)
     committed: list[Produced] = field(default_factory=list)
+    pending_headers: list[ProducedHeaders | None] = field(default_factory=list)
+    committed_headers: list[ProducedHeaders | None] = field(default_factory=list)
     sent_offsets: list[tuple[set[Position], object]] = field(default_factory=list)
     failures: dict[str, deque[KafkaException]] = field(default_factory=dict)
     state: TxnState = TxnState.NONE
@@ -235,10 +260,19 @@ class FakeProducer:
         self._call("begin_transaction", (TxnState.NONE,))
         self.state = TxnState.IN_TRANSACTION
 
-    def produce(self, topic: str, value: bytes, key: bytes, /) -> None:
-        """Добавляет запись в текущую транзакцию."""
+    def produce(
+        self,
+        topic: str,
+        value: bytes,
+        key: bytes,
+        /,
+        *,
+        headers: ProducedHeaders | None = None,
+    ) -> None:
+        """Добавляет запись (и её заголовки) в текущую транзакцию."""
         self._call("produce", (TxnState.IN_TRANSACTION,))
         self.pending.append((topic, key, value))
+        self.pending_headers.append(headers)
 
     def send_offsets_to_transaction(
         self, positions: list[TopicPartition], group_metadata: object, /
@@ -247,17 +281,25 @@ class FakeProducer:
         self._call("send_offsets_to_transaction", (TxnState.IN_TRANSACTION,))
         self.sent_offsets.append((positions_of(positions), group_metadata))
 
+    def flush(self) -> int:
+        """Доставляет поставленные записи (в фейке — сразу); недоставленных нет."""
+        self._call("flush", (TxnState.IN_TRANSACTION,))
+        return 0
+
     def commit_transaction(self) -> None:
         """Фиксирует записи транзакции."""
         self._call("commit_transaction", (TxnState.IN_TRANSACTION, TxnState.COMMITTING))
         self.committed.extend(self.pending)
+        self.committed_headers.extend(self.pending_headers)
         self.pending.clear()
+        self.pending_headers.clear()
         self.state = TxnState.NONE
 
     def abort_transaction(self) -> None:
         """Отбрасывает записи транзакции (только из IN_TRANSACTION или ABORTABLE)."""
         self._call("abort_transaction", (TxnState.IN_TRANSACTION, TxnState.ABORTABLE))
         self.pending.clear()
+        self.pending_headers.clear()
         self.state = TxnState.NONE
 
 
@@ -268,14 +310,19 @@ class FakeStateConsumer:
     records — пары (ключ, значение) с офсетами first_offset, first_offset + 1, ...
     (или явными offsets для compacted-топика с пропусками). Low watermark — первый офсет,
     high — последний + 1 (для пустого топика low = high = first_offset).
+    headers — заголовки записей (параллельно records; None — у всех записей заголовков нет).
     watermarks_timeout — get_watermark_offsets возвращает None (таймаут запроса).
     Заготовки из injected (например, EOF) отдаются первыми, позицию не меняют.
     on_consume вызывается перед каждым consume (например, чтобы сдвинуть часы).
+    lso — открытая чужая транзакция: записи с офсетом не меньше lso не видны
+    (read_committed), на границе отдаётся EOF, пока consume не вызван lso_resolved_at раз;
+    get_watermark_offsets при этом отдаёт настоящий high (как клиент с read_uncommitted).
     """
 
     records: list[tuple[bytes | None, bytes | None]] = field(default_factory=list)
     first_offset: int = 0
     offsets: list[int] | None = None
+    headers: list[MessageHeaders | None] | None = None
     max_per_call: int = 1_000_000
     watermarks_timeout: bool = False
     injected: deque[list[FakeMessage]] = field(default_factory=deque)
@@ -283,6 +330,8 @@ class FakeStateConsumer:
     assigned: list[Position] = field(default_factory=list)
     watermark_timeouts: list[float] = field(default_factory=list)
     consume_calls: int = 0
+    lso: int | None = None
+    lso_resolved_at: int = 0
     _pos: int = 0
 
     def _offsets(self) -> list[int]:
@@ -323,12 +372,20 @@ class FakeStateConsumer:
         if self.injected:
             return self.injected.popleft()
         out: list[FakeMessage] = []
-        for off, (key, value) in zip(self._offsets(), self.records, strict=True):
+        headers = self.headers if self.headers is not None else [None] * len(self.records)
+        visible_below = (
+            self.lso if self.lso is not None and self.consume_calls < self.lso_resolved_at else None
+        )
+        for off, (key, value), hdrs in zip(self._offsets(), self.records, headers, strict=True):
+            if visible_below is not None and off >= visible_below:
+                break
             if off >= self._pos and len(out) < min(num_messages, self.max_per_call):
-                out.append(FakeMessage(STATE, 0, off, value, key))
+                out.append(FakeMessage(STATE, 0, off, value, key, headers_=hdrs))
         if out:
             assert out[-1].offset_ is not None
             self._pos = out[-1].offset_ + 1
+        if visible_below is not None and self._pos >= visible_below:
+            out.append(eof(offset=self._pos, topic=STATE))
         return out
 
     def position(self, partitions: list[TopicPartition], /) -> list[TopicPartition]:

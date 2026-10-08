@@ -11,6 +11,7 @@ abort, откат процессора и seek на начало батча (п�
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Sequence
@@ -30,6 +31,7 @@ from tests.unit.adapters.fakes import (
     FakeMessage,
     FakeProducer,
     FakeStateConsumer,
+    MessageHeaders,
     Produced,
     TxnState,
     abortable_error,
@@ -40,7 +42,12 @@ from tests.unit.adapters.fakes import (
 from vqueue.adapters import kafka_runner as runner_module
 from vqueue.adapters.codec import encode_snapshot
 from vqueue.adapters.health import HealthState
-from vqueue.adapters.kafka_runner import KafkaRunner, load_snapshot
+from vqueue.adapters.kafka_runner import (
+    NEXT_OFFSET_HEADER,
+    KafkaRunner,
+    RestoredState,
+    load_snapshot,
+)
 from vqueue.adapters.processor import TelemetryProcessor
 from vqueue.adapters.topics import STATE, TELEMETRY
 from vqueue.domain.site import SiteSnapshot, SiteState
@@ -81,9 +88,9 @@ class CountingHealth(HealthState):
         super().mark_poll()
 
 
-def _no_snapshot() -> SiteSnapshot | None:
-    """Загрузчик снимка для тестов, где восстановление не важно."""
-    return None
+def _no_snapshot() -> RestoredState:
+    """Загрузчик снимка для тестов, где восстановление не важно: снимка и позиции нет."""
+    return RestoredState(None, None)
 
 
 def _runner(
@@ -153,7 +160,7 @@ def test_run_once_marks_poll_on_non_empty_batch() -> None:
 
 
 def test_run_once_success_transaction_call_order() -> None:
-    """Begin → produce каждой записи → send_offsets → commit."""
+    """Begin → produce каждой записи → flush (доставка до офсетов) → send_offsets → commit."""
     consumer, producer = FakeConsumer(_log(EXAMPLE_VALUES)), FakeProducer()
     runner, _ = _runner(consumer, producer)
 
@@ -163,6 +170,7 @@ def test_run_once_success_transaction_call_order() -> None:
     assert producer.calls == [
         "begin_transaction",
         *["produce"] * len(expected),
+        "flush",
         "send_offsets_to_transaction",
         "commit_transaction",
     ]
@@ -197,31 +205,82 @@ def test_run_once_success_sends_last_offset_plus_one() -> None:
     assert producer.sent_offsets == [({(TELEMETRY, 0, last + 1)}, consumer.group_metadata)]
 
 
-def test_run_once_multi_partition_offsets_per_partition() -> None:
-    """Offset последнего + 1 по каждой партиции батча отдельно."""
+def _two_partition_batch() -> list[FakeMessage]:
+    """Батч, в котором сообщения двух партиций telemetry перемешаны."""
     p0 = _log(EXAMPLE_VALUES[:3], partition=0, first=10)
     p1 = _log(EXAMPLE_VALUES[3:], partition=1, first=5)
-    consumer = FakeConsumer([p0[0], p1[0], p0[1], p1[1], p0[2]])
+    return [p0[0], p1[0], p0[1], p1[1], p0[2]]
+
+
+def test_run_once_multi_partition_batch_raises_value_error_before_transaction() -> None:
+    """Модель «площадка = 1 партиция»: батч из нескольких партиций → ValueError до begin."""
+    consumer = FakeConsumer(_two_partition_batch())
     producer = FakeProducer()
-    runner, _ = _runner(consumer, producer)
+    runner, processor = _runner(consumer, producer)
 
-    assert runner.run_once() == 5
+    with pytest.raises(ValueError):
+        runner.run_once()
 
-    assert producer.sent_offsets[0][0] == {(TELEMETRY, 0, 13), (TELEMETRY, 1, 7)}
+    assert producer.calls == []
+    assert consumer.seeks == []
+    assert processor.snapshot() == SiteState(SITE).snapshot()
 
 
-def test_run_once_values_processed_in_batch_order() -> None:
-    """Значения передаются процессору в порядке батча (детерминизм по партиции)."""
-    p0 = _log(EXAMPLE_VALUES[:3], partition=0, first=10)
-    p1 = _log(EXAMPLE_VALUES[3:], partition=1, first=5)
-    order = [p0[0], p1[0], p0[1], p1[1], p0[2]]
+def _header_bytes(value: str | bytes | None) -> bytes | None:
+    """Значение заголовка в байтах (продюсер принимает str и bytes)."""
+    return value.encode() if isinstance(value, str) else value
+
+
+def test_run_once_state_record_carries_next_offset_header() -> None:
+    """У записи STATE заголовок telemetry-next-offset = последний офсет + 1 (как в send_offsets)."""
     producer = FakeProducer()
-    runner, _ = _runner(FakeConsumer(order), producer)
+    runner, _ = _runner(FakeConsumer(_log(EXAMPLE_VALUES)), producer)
 
     runner.run_once()
 
-    values = [m.value_ for m in order]
-    assert producer.committed == _baseline([v for v in values if v is not None])
+    next_offset = FIRST_OFFSET + len(EXAMPLE_VALUES)
+    assert NEXT_OFFSET_HEADER == "telemetry-next-offset"
+    assert producer.committed[-1][0] == STATE
+    state_headers = producer.committed_headers[-1]
+    assert state_headers is not None
+    assert [(k, _header_bytes(v)) for k, v in state_headers] == [
+        (NEXT_OFFSET_HEADER, str(next_offset).encode("ascii"))
+    ]
+    assert producer.sent_offsets[0][0] == {(TELEMETRY, 0, next_offset)}
+
+
+def test_run_once_non_state_records_without_headers() -> None:
+    """Записи queue.v1 и decision.v1 публикуются без заголовков."""
+    producer = FakeProducer()
+    runner, _ = _runner(FakeConsumer(_log(EXAMPLE_VALUES)), producer)
+
+    runner.run_once()
+
+    others = [
+        h
+        for (topic, _, _), h in zip(producer.committed, producer.committed_headers, strict=True)
+        if topic != STATE
+    ]
+    assert others
+    assert all(not h for h in others)
+
+
+def test_run_once_next_offset_header_per_batch() -> None:
+    """Каждый батч пишет в снимок свою позицию: офсет после последнего сообщения батча."""
+    producer = FakeProducer()
+    runner, _ = _runner(FakeConsumer(_log(EXAMPLE_VALUES), max_per_call=2), producer)
+
+    while runner.run_once():
+        pass
+
+    state_headers = [
+        h
+        for (topic, _, _), h in zip(producer.committed, producer.committed_headers, strict=True)
+        if topic == STATE
+    ]
+    assert [[(k, _header_bytes(v)) for k, v in h or []] for h in state_headers] == [
+        [(NEXT_OFFSET_HEADER, str(FIRST_OFFSET + n).encode())] for n in (2, 4, 5)
+    ]
 
 
 def test_run_once_consecutive_batches_continue_state() -> None:
@@ -271,10 +330,10 @@ def test_run_once_only_eof_returns_zero() -> None:
     assert runner.run_once() == 0
 
 
-def test_run_once_other_message_error_raises_kafka_exception() -> None:
-    """Иная ошибка в сообщении → KafkaException наружу, транзакция не начата."""
+def test_run_once_fatal_message_error_raises_kafka_exception() -> None:
+    """Фатальная ошибка консьюмера в сообщении → KafkaException наружу, транзакция не начата."""
     consumer = FakeConsumer()
-    error = FakeMessage(error_=KafkaError(KafkaError.UNKNOWN_TOPIC_OR_PART, "no topic"))
+    error = FakeMessage(error_=KafkaError(KafkaError._FATAL, "fatal", fatal=True))
     consumer.injected.append([*_log(EXAMPLE_VALUES[:1]), error])
     producer = FakeProducer()
     runner, _ = _runner(consumer, producer)
@@ -284,6 +343,24 @@ def test_run_once_other_message_error_raises_kafka_exception() -> None:
 
     assert producer.committed == []
     assert "commit_transaction" not in producer.calls
+
+
+def test_run_once_non_fatal_message_error_skipped_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Нефатальная ошибка консьюмера → WARNING, данные батча фиксируются."""
+    data = _log(EXAMPLE_VALUES)
+    consumer = FakeConsumer()
+    error = FakeMessage(error_=KafkaError(KafkaError.UNKNOWN_TOPIC_OR_PART, "no topic"))
+    consumer.injected.append([*data[:2], error, *data[2:]])
+    producer = FakeProducer()
+    runner, _ = _runner(consumer, producer)
+
+    with caplog.at_level(logging.WARNING):
+        assert runner.run_once() == len(EXAMPLE_VALUES)
+
+    assert producer.committed == _baseline(EXAMPLE_VALUES)
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
 @pytest.mark.parametrize("missing", ["topic_", "partition_", "offset_"])
@@ -465,20 +542,6 @@ def test_run_once_abort_then_replay_exactly_once_outputs() -> None:
     )
 
 
-def test_run_once_abort_multi_partition_seeks_min_offset_per_partition() -> None:
-    """Seek на минимальный офсет батча по каждой партиции."""
-    p0 = _log(EXAMPLE_VALUES[:3], partition=0, first=10)
-    p1 = _log(EXAMPLE_VALUES[3:], partition=1, first=5)
-    consumer = FakeConsumer([p0[0], p1[0], p0[1], p1[1], p0[2]])
-    producer = FakeProducer()
-    producer.fail("commit_transaction", abortable_error())
-    runner, _ = _runner(consumer, producer)
-
-    runner.run_once()
-
-    assert set(consumer.seeks) == {(TELEMETRY, 0, 10), (TELEMETRY, 1, 5)}
-
-
 def test_run_once_abort_does_not_mark_poll_again() -> None:
     """При откате readiness не продлевается: mark_poll — один раз за consume."""
     health = CountingHealth()
@@ -489,6 +552,66 @@ def test_run_once_abort_does_not_mark_poll_again() -> None:
     assert runner.run_once() == 0
 
     assert health.polls == 1
+
+
+def test_run_once_retriable_abort_retried_then_rolled_back() -> None:
+    """Retriable-ошибка abort_transaction → повтор abort, затем обычный откат батча."""
+    consumer = FakeConsumer(_log(EXAMPLE_VALUES))
+    producer = FakeProducer()
+    producer.fail("commit_transaction", abortable_error())
+    producer.fail("abort_transaction", retriable_error())
+    runner, processor = _runner(consumer, producer)
+
+    assert runner.run_once() == 0
+
+    assert producer.count("abort_transaction") == 2
+    assert producer.state is TxnState.NONE
+    assert processor.snapshot() == SiteState(SITE).snapshot()
+    assert set(consumer.seeks) == {(TELEMETRY, 0, FIRST_OFFSET)}
+
+
+class BufferFullProducer(FakeProducer):
+    """Продюсер, у которого переполнена очередь отправки: produce → BufferError."""
+
+    def produce(
+        self,
+        topic: str,
+        value: bytes,
+        key: bytes,
+        /,
+        *,
+        headers: Any = None,
+    ) -> None:
+        """Записывает вызов и выбрасывает BufferError, как confluent_kafka при полной очереди."""
+        self.calls.append("produce")
+        raise BufferError("Local: Queue full")
+
+
+def test_run_once_non_kafka_error_aborts_transaction_and_propagates() -> None:
+    """Не-Kafka ошибка внутри транзакции → abort (транзакция не держит LSO), затем наружу."""
+    producer = BufferFullProducer()
+    runner, _ = _runner(FakeConsumer(_log(EXAMPLE_VALUES)), producer)
+
+    with pytest.raises(BufferError):
+        runner.run_once()
+
+    assert producer.count("abort_transaction") == 1
+    assert producer.state is TxnState.NONE
+    assert producer.committed == []
+
+
+def test_run_once_non_kafka_error_propagates_even_if_abort_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Сбой abort после не-Kafka ошибки логируется, наружу уходит исходная ошибка."""
+    producer = BufferFullProducer()
+    producer.fail("abort_transaction", fatal_error())
+    runner, _ = _runner(FakeConsumer(_log(EXAMPLE_VALUES)), producer)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(BufferError):
+        runner.run_once()
+
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
 
 
 def test_run_once_consecutive_aborts_limit_raises_after_full_rollback() -> None:
@@ -618,14 +741,19 @@ def _snapshots() -> list[SiteSnapshot]:
     return out
 
 
+def _load(consumer: FakeStateConsumer, **kwargs: Any) -> RestoredState:
+    """load_snapshot, где фейк служит и читающим консьюмером, и источником watermark."""
+    return load_snapshot(consumer, consumer, SITE_ID, **kwargs)
+
+
 def test_load_snapshot_empty_topic_returns_none() -> None:
     """Пустой топик состояния — снимка нет (первый запуск)."""
-    assert load_snapshot(FakeStateConsumer(), SITE_ID) is None
+    assert _load(FakeStateConsumer()) == RestoredState(None, None)
 
 
 def test_load_snapshot_empty_compacted_topic_nonzero_offsets_returns_none() -> None:
     """Пустой топик с ненулевыми watermark (low = high) — снимка нет."""
-    assert load_snapshot(FakeStateConsumer(first_offset=57), SITE_ID) is None
+    assert _load(FakeStateConsumer(first_offset=57)) == RestoredState(None, None)
 
 
 def test_load_snapshot_single_value_decoded() -> None:
@@ -633,14 +761,14 @@ def test_load_snapshot_single_value_decoded() -> None:
     snap = _snapshots()[0]
     consumer = FakeStateConsumer([(SITE_ID.encode(), encode_snapshot(snap))])
 
-    assert load_snapshot(consumer, SITE_ID) == snap
+    assert _load(consumer).snapshot == snap
 
 
 def test_load_snapshot_reads_state_topic_partition_zero() -> None:
     """Чтение — из топика состояния, партиция 0."""
     consumer = FakeStateConsumer([(SITE_ID.encode(), encode_snapshot(_snapshots()[0]))])
 
-    load_snapshot(consumer, SITE_ID)
+    _load(consumer)
 
     assert {(t, p) for t, p, _ in consumer.assigned} == {(STATE, 0)}
 
@@ -658,7 +786,7 @@ def test_load_snapshot_several_values_last_wins() -> None:
         max_per_call=1,
     )
 
-    assert load_snapshot(consumer, SITE_ID) == third
+    assert _load(consumer).snapshot == third
 
 
 def test_load_snapshot_compacted_offsets_with_gaps_last_wins() -> None:
@@ -671,7 +799,7 @@ def test_load_snapshot_compacted_offsets_with_gaps_last_wins() -> None:
         max_per_call=1,
     )
 
-    assert load_snapshot(consumer, SITE_ID) == third
+    assert _load(consumer).snapshot == third
 
 
 def test_load_snapshot_foreign_keys_ignored() -> None:
@@ -689,14 +817,14 @@ def test_load_snapshot_foreign_keys_ignored() -> None:
         max_per_call=2,
     )
 
-    assert load_snapshot(consumer, SITE_ID) == second
+    assert _load(consumer).snapshot == second
 
 
 def test_load_snapshot_only_foreign_keys_returns_none() -> None:
     """В топике только чужие ключи — снимка этой площадки нет."""
     consumer = FakeStateConsumer([(b"site-2", encode_snapshot(_snapshots()[0]))])
 
-    assert load_snapshot(consumer, SITE_ID) is None
+    assert _load(consumer) == RestoredState(None, None)
 
 
 def test_load_snapshot_partition_eof_after_data_ignored() -> None:
@@ -712,27 +840,69 @@ def test_load_snapshot_partition_eof_after_data_ignored() -> None:
         ]
     )
 
-    assert load_snapshot(consumer, SITE_ID) == second
+    assert _load(consumer).snapshot == second
 
 
-def test_load_snapshot_other_error_raises_kafka_exception() -> None:
-    """Иная ошибка при чтении топика состояния — KafkaException (как в run_once)."""
+def test_load_snapshot_fatal_error_raises_kafka_exception() -> None:
+    """Фатальная ошибка при чтении топика состояния — KafkaException (как в run_once)."""
     consumer = FakeStateConsumer([(SITE_ID.encode(), encode_snapshot(_snapshots()[0]))])
+    consumer.injected.append(
+        [FakeMessage(STATE, 0, 0, error_=KafkaError(KafkaError._FATAL, "x", fatal=True))]
+    )
+
+    with pytest.raises(KafkaException):
+        _load(consumer)
+
+
+def test_load_snapshot_non_fatal_error_skipped() -> None:
+    """Нефатальная ошибка при чтении топика состояния пропускается, снимок дочитывается."""
+    snap = _snapshots()[0]
+    consumer = FakeStateConsumer([(SITE_ID.encode(), encode_snapshot(snap))])
     consumer.injected.append(
         [FakeMessage(STATE, 0, 0, error_=KafkaError(KafkaError.UNKNOWN_TOPIC_OR_PART, "x"))]
     )
 
-    with pytest.raises(KafkaException):
-        load_snapshot(consumer, SITE_ID)
+    assert _load(consumer).snapshot == snap
+
+
+def test_load_snapshot_waits_for_open_transaction_below_high_watermark() -> None:
+    """Переход на резерв: последний снимок — в незавершённой транзакции «зомби».
+
+    EOF при read_committed наступает на LSO (перед открытой транзакцией), а не на high.
+    Чтение не останавливается на EOF и ждёт исхода транзакции: восстанавливается снимок,
+    который «зомби» зафиксировал, а не предыдущий, — иначе его батч обработался бы дважды.
+    """
+    first, second, _ = _snapshots()
+    key = SITE_ID.encode()
+    consumer = FakeStateConsumer(
+        [(key, encode_snapshot(first)), (key, encode_snapshot(second))],
+        headers=[[(NEXT_OFFSET_HEADER, b"10")], [(NEXT_OFFSET_HEADER, b"20")]],
+        lso=1,
+        lso_resolved_at=3,
+    )
+
+    assert _load(consumer) == RestoredState(second, 20)
+    assert consumer.consume_calls >= 3
+
+
+def test_load_snapshot_watermark_from_separate_client() -> None:
+    """High watermark запрашивается у отдельного клиента (read_uncommitted), а не у читающего."""
+    snap = _snapshots()[0]
+    reader = FakeStateConsumer([(SITE_ID.encode(), encode_snapshot(snap))])
+    watermarks = FakeStateConsumer([(SITE_ID.encode(), encode_snapshot(snap))])
+
+    assert load_snapshot(reader, watermarks, SITE_ID).snapshot == snap
+    assert reader.watermark_timeouts == []
+    assert watermarks.watermark_timeouts
 
 
 def test_load_snapshot_tombstone_last_returns_none() -> None:
-    """Tombstone (value = null) последним по ключу — снимок удалён, восстановления нет."""
+    """Tombstone (value = null) последним по ключу — снимок удалён: RestoredState(None, None)."""
     consumer = FakeStateConsumer(
         [(SITE_ID.encode(), encode_snapshot(_snapshots()[0])), (SITE_ID.encode(), None)]
     )
 
-    assert load_snapshot(consumer, SITE_ID) is None
+    assert _load(consumer) == RestoredState(None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -747,14 +917,14 @@ def test_load_snapshot_watermarks_timeout_raises_timeout_error() -> None:
     )
 
     with pytest.raises(TimeoutError):
-        load_snapshot(consumer, SITE_ID, timeout_s=5.0)
+        _load(consumer, timeout_s=5.0)
 
 
 def test_load_snapshot_watermarks_requested_with_positive_timeout() -> None:
     """Запрос watermarks ограничен по времени: таймаут > 0 и не больше общего."""
     consumer = FakeStateConsumer([(SITE_ID.encode(), encode_snapshot(_snapshots()[0]))])
 
-    load_snapshot(consumer, SITE_ID, timeout_s=5.0)
+    _load(consumer, timeout_s=5.0)
 
     assert consumer.watermark_timeouts
     assert all(0 < t <= 5.0 for t in consumer.watermark_timeouts)
@@ -782,7 +952,7 @@ def test_load_snapshot_overall_deadline_raises_timeout_error(
     )
 
     with pytest.raises(TimeoutError):
-        load_snapshot(consumer, SITE_ID, timeout_s=25.0)
+        _load(consumer, timeout_s=25.0)
 
     assert consumer.consume_calls < len(snaps) * 4
 
@@ -806,9 +976,9 @@ def test_on_assign_empty_marks_unassigned_without_reset() -> None:
     """Пустое назначение → mark_assigned(False), загрузчик не вызывается, состояние не трогается."""
     calls: list[int] = []
 
-    def loader() -> SiteSnapshot | None:
+    def loader() -> RestoredState:
         calls.append(1)
-        return None
+        return RestoredState(None, None)
 
     consumer = FakeConsumer(_log(EXAMPLE_VALUES))
     health = _ready_health()
@@ -829,7 +999,9 @@ def test_on_assign_single_partition_resets_from_loader_and_marks_assigned() -> N
     health = HealthState()
     health.mark_poll()
     consumer = FakeConsumer()
-    runner, processor = _runner(consumer, FakeProducer(), health, load_snapshot=lambda: snap)
+    runner, processor = _runner(
+        consumer, FakeProducer(), health, load_snapshot=lambda: RestoredState(snap, None)
+    )
 
     runner.on_assign(consumer, [ASSIGNED_TP])
 
@@ -842,7 +1014,9 @@ def test_on_assign_after_revoke_state_from_loader_not_memory() -> None:
     loaded = _snapshots()[0]
     consumer = FakeConsumer(_log(EXAMPLE_VALUES))
     health = _ready_health()
-    runner, processor = _runner(consumer, FakeProducer(), health, load_snapshot=lambda: loaded)
+    runner, processor = _runner(
+        consumer, FakeProducer(), health, load_snapshot=lambda: RestoredState(loaded, None)
+    )
     runner.run_once()
     assert processor.snapshot() != loaded
 
@@ -885,3 +1059,193 @@ def test_on_revoke_or_lost_marks_unassigned(callback: str) -> None:
     getattr(runner, callback)(consumer, [ASSIGNED_TP])
 
     assert not health.is_ready(60.0)
+
+
+def test_on_assign_without_next_offset_does_not_call_assign() -> None:
+    """Нет позиции в снимке → consumer.assign не вызывается: позиция — офсет группы."""
+    consumer = FakeConsumer()
+    runner, _ = _runner(
+        consumer, FakeProducer(), load_snapshot=lambda: RestoredState(_snapshots()[0], None)
+    )
+
+    runner.on_assign(consumer, [TopicPartition(TELEMETRY, 0)])
+
+    assert consumer.assign_calls == []
+
+
+def test_on_assign_with_next_offset_assigns_partition_at_snapshot_position(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Позиция в снимке → partitions[0].offset = next_offset и consumer.assign, лог INFO."""
+    snap = _snapshots()[0]
+    consumer = FakeConsumer()
+    health = HealthState()
+    health.mark_poll()
+    runner, processor = _runner(
+        consumer, FakeProducer(), health, load_snapshot=lambda: RestoredState(snap, 102)
+    )
+    partitions = [TopicPartition(TELEMETRY, 0)]
+
+    with caplog.at_level(logging.INFO):
+        runner.on_assign(consumer, partitions)
+
+    assert consumer.assign_calls == [[(TELEMETRY, 0, 102)]]
+    assert partitions[0].offset == 102
+    assert processor.snapshot() == snap
+    assert health.is_ready(60.0)
+    assert any(r.levelno == logging.INFO for r in caplog.records)
+
+
+@pytest.mark.parametrize("use_snapshot_offset", [True, False])
+def test_on_assign_snapshot_position_wins_over_group_offset(use_snapshot_offset: bool) -> None:
+    """Гонка при переходе на резерв: офсет группы впереди снимка (транзакция «зомби»).
+
+    Снимок сделан после офсетов 100–101 (next_offset 102), а группа уже на 103. С позицией
+    из снимка батч 102 не выпадает — выходы как без сбоя. Без неё (запасной путь) чтение
+    идёт с офсета группы и сообщение 102 теряется — это и устраняет заголовок.
+    """
+    before = TelemetryProcessor(SITE, SITE_ID)
+    before.process(EXAMPLE_VALUES[:2])
+    snap = before.snapshot()
+    next_offset = 102 if use_snapshot_offset else None
+    consumer = FakeConsumer(_log(EXAMPLE_VALUES), group_offsets={(TELEMETRY, 0): FIRST_OFFSET + 3})
+    producer = FakeProducer()
+    runner, _ = _runner(consumer, producer, load_snapshot=lambda: RestoredState(snap, next_offset))
+    runner.on_assign(consumer, [TopicPartition(TELEMETRY, 0)])
+
+    processed = runner.run_once()
+
+    resumed = TelemetryProcessor(SITE, SITE_ID, snap)
+    if use_snapshot_offset:
+        assert processed == 3
+        expected = resumed.process(EXAMPLE_VALUES[2:])
+    else:
+        assert processed == 2
+        expected = resumed.process(EXAMPLE_VALUES[3:])
+    assert producer.committed == [(r.topic, r.key, r.value) for r in expected]
+
+
+# ---------------------------------------------------------------------------
+# load_snapshot: позиция чтения из заголовка снимка (telemetry-next-offset)
+# ---------------------------------------------------------------------------
+
+
+def _state_with_headers(*headers: MessageHeaders | None) -> FakeStateConsumer:
+    """Топик состояния: по снимку примера на каждый набор заголовков, последний — с последним."""
+    snaps = _snapshots()
+    key = SITE_ID.encode()
+    records: list[tuple[bytes | None, bytes | None]] = [
+        (key, encode_snapshot(snaps[i % len(snaps)])) for i in range(len(headers))
+    ]
+    return FakeStateConsumer(records, headers=list(headers), max_per_call=1)
+
+
+def _last_snapshot(count: int) -> SiteSnapshot:
+    """Снимок, который _state_with_headers кладёт последним при count записях."""
+    snaps = _snapshots()
+    return snaps[(count - 1) % len(snaps)]
+
+
+def test_load_snapshot_header_decimal_next_offset_restored() -> None:
+    """Заголовок telemetry-next-offset = "123" → RestoredState(снимок, 123)."""
+    consumer = _state_with_headers([(NEXT_OFFSET_HEADER, b"123")])
+
+    assert _load(consumer) == RestoredState(_last_snapshot(1), 123)
+
+
+def test_load_snapshot_header_zero_restored() -> None:
+    """Граница: next_offset 0 — валидная позиция (а не «нет позиции»)."""
+    consumer = _state_with_headers([(NEXT_OFFSET_HEADER, b"0")])
+
+    assert _load(consumer).next_offset == 0
+
+
+def test_load_snapshot_header_among_other_headers_found() -> None:
+    """Посторонние заголовки не мешают найти позицию."""
+    consumer = _state_with_headers([("trace-id", b"abc"), (NEXT_OFFSET_HEADER, b"77")])
+
+    assert _load(consumer).next_offset == 77
+
+
+def test_load_snapshot_header_from_last_record_only() -> None:
+    """Позиция берётся из той же (последней) записи, что и снимок: у неё заголовка нет → None."""
+    consumer = _state_with_headers([(NEXT_OFFSET_HEADER, b"50")], None)
+
+    assert _load(consumer) == RestoredState(_last_snapshot(2), None)
+
+
+def test_load_snapshot_header_of_foreign_key_ignored() -> None:
+    """Заголовок записи чужой площадки не влияет на позицию этой площадки."""
+    snap = _snapshots()[0]
+    consumer = FakeStateConsumer(
+        [(SITE_ID.encode(), encode_snapshot(snap)), (b"site-2", encode_snapshot(snap))],
+        headers=[[(NEXT_OFFSET_HEADER, b"10")], [(NEXT_OFFSET_HEADER, b"999")]],
+    )
+
+    assert _load(consumer) == RestoredState(snap, 10)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param(None, id="no-headers"),
+        pytest.param([], id="empty-headers"),
+        pytest.param([("trace-id", b"1")], id="other-header-only"),
+        pytest.param([(NEXT_OFFSET_HEADER, None)], id="header-value-none"),
+    ],
+)
+def test_load_snapshot_without_header_next_offset_none_no_warning(
+    headers: MessageHeaders | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Нет заголовка (или его значение None) → next_offset None без предупреждения."""
+    consumer = _state_with_headers(headers)
+
+    with caplog.at_level(logging.WARNING):
+        restored = _load(consumer)
+
+    assert restored == RestoredState(_last_snapshot(1), None)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(b"abc", id="letters"),
+        pytest.param(b"12a", id="trailing-letter"),
+        pytest.param(b"1.5", id="fraction"),
+        pytest.param(b"-1", id="negative"),
+        pytest.param(b"", id="empty"),
+        pytest.param(b" 12", id="leading-space"),
+        pytest.param("١٢".encode(), id="non-ascii-digits"),
+        pytest.param(b"\xff", id="not-utf8"),
+    ],
+)
+def test_load_snapshot_broken_header_next_offset_none_with_warning(
+    value: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Битый заголовок (не десятичное ASCII) → next_offset None и WARNING; снимок сохраняется."""
+    consumer = _state_with_headers([(NEXT_OFFSET_HEADER, value)])
+
+    with caplog.at_level(logging.WARNING):
+        restored = _load(consumer)
+
+    assert restored == RestoredState(_last_snapshot(1), None)
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_load_snapshot_repeated_header_last_wins() -> None:
+    """Повторяющийся заголовок в одной записи → берётся последний."""
+    consumer = _state_with_headers([(NEXT_OFFSET_HEADER, b"5"), (NEXT_OFFSET_HEADER, b"9")])
+
+    assert _load(consumer).next_offset == 9
+
+
+def test_load_snapshot_tombstone_with_header_returns_empty() -> None:
+    """Tombstone последним (даже с заголовком) → RestoredState(None, None)."""
+    snap = _snapshots()[0]
+    consumer = FakeStateConsumer(
+        [(SITE_ID.encode(), encode_snapshot(snap)), (SITE_ID.encode(), None)],
+        headers=[[(NEXT_OFFSET_HEADER, b"10")], [(NEXT_OFFSET_HEADER, b"20")]],
+    )
+
+    assert _load(consumer) == RestoredState(None, None)

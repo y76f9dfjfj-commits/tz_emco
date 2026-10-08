@@ -32,11 +32,13 @@ class OutRecord:
         topic: Топик.
         key: Ключ сообщения.
         value: Значение сообщения.
+        headers: Заголовки сообщения (ключ, значение) в порядке публикации.
     """
 
     topic: str
     key: bytes
     value: bytes
+    headers: tuple[tuple[str, bytes], ...] = ()
 
 
 class TelemetryProcessor:

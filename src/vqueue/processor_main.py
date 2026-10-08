@@ -22,15 +22,21 @@ from confluent_kafka import Consumer, Producer
 
 from vqueue.adapters import topics
 from vqueue.adapters.health import HealthState, start_health_server
-from vqueue.adapters.kafka_runner import KafkaRunner, load_snapshot
+from vqueue.adapters.kafka_runner import KafkaRunner, RestoredState, load_snapshot
 from vqueue.adapters.processor import TelemetryProcessor
 from vqueue.config import load_site_config
-from vqueue.domain.site import SiteSnapshot
 
 logger = logging.getLogger("vqueue.processor")
 
 _LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _MAX_PORT: Final = 65_535
+
+_TRANSACTION_TIMEOUT_MS: Final = 20_000
+"""Предел жизни транзакции: столько новый владелец партиции ждёт исхода транзакции «зомби»."""
+
+_RESTORE_TIMEOUT_S: Final = 60.0
+"""Предел восстановления снимка: больше _TRANSACTION_TIMEOUT_MS с запасом на проверку
+просроченных транзакций координатором (по умолчанию раз в 10 с)."""
 
 
 class _JsonFormatter(logging.Formatter):
@@ -163,23 +169,32 @@ def main() -> None:
             "bootstrap.servers": settings.kafka_bootstrap,
             "transactional.id": f"vqueue-processor-{settings.site_id}-{settings.instance_id}",
             "enable.idempotence": True,
+            "transaction.timeout.ms": _TRANSACTION_TIMEOUT_MS,
         }
     )
     producer.init_transactions()
 
-    def restore() -> SiteSnapshot | None:
-        state_consumer = Consumer(
-            {
-                "bootstrap.servers": settings.kafka_bootstrap,
-                "group.id": f"{settings.consumer_group}-state",
-                "enable.auto.commit": False,
-                "isolation.level": "read_committed",
-                "enable.partition.eof": True,
-            }
-        )
+    def restore() -> RestoredState:
+        def state_client(isolation: str) -> Consumer:
+            return Consumer(
+                {
+                    "bootstrap.servers": settings.kafka_bootstrap,
+                    "group.id": f"{settings.consumer_group}-state",
+                    "enable.auto.commit": False,
+                    "isolation.level": isolation,
+                    "enable.partition.eof": True,
+                }
+            )
+
+        state_consumer = state_client("read_committed")
+        # read_uncommitted: high watermark, а не LSO (см. load_snapshot).
+        watermarks = state_client("read_uncommitted")
         try:
-            return load_snapshot(state_consumer, settings.site_id)
+            return load_snapshot(
+                state_consumer, watermarks, settings.site_id, timeout_s=_RESTORE_TIMEOUT_S
+            )
         finally:
+            watermarks.close()
             state_consumer.close()
 
     consumer_config: dict[str, str | int | bool] = {
