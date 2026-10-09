@@ -230,17 +230,38 @@ def committed_offset(bootstrap: str, group: str, topic: str, partition: int = 0)
         probe.close()
 
 
+_COORDINATOR_NOT_READY: Final = frozenset(
+    {
+        KafkaError.NOT_COORDINATOR,
+        KafkaError.COORDINATOR_NOT_AVAILABLE,
+        KafkaError.COORDINATOR_LOAD_IN_PROGRESS,
+    }
+)
+"""Ошибки «координатор групп ещё не готов» — типичны для только что запущенного брокера."""
+
+
 def active_members(bootstrap: str, group: str, timeout_s: float = 10.0) -> int:
-    """Число активных участников консьюмер-группы (0 — группы нет или она пуста)."""
+    """Число активных участников консьюмер-группы (0 — группы нет или она пуста).
+
+    На свежем брокере (например, в CI) координатор групп появляется не сразу: запрос
+    повторяется до timeout_s. Если координатор так и не готов, групп на брокере ещё не было —
+    значит, и участников нет.
+    """
     admin = AdminClient({"bootstrap.servers": bootstrap})
-    fut = admin.describe_consumer_groups([group], request_timeout=timeout_s)[group]
-    try:
-        description = fut.result()
-    except KafkaException as exc:
-        if exc.args[0].code() == KafkaError.GROUP_ID_NOT_FOUND:
-            return 0
-        raise
-    return len(description.members)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        fut = admin.describe_consumer_groups([group], request_timeout=timeout_s)[group]
+        try:
+            return len(fut.result().members)
+        except KafkaException as exc:
+            code = exc.args[0].code()
+            if code == KafkaError.GROUP_ID_NOT_FOUND:
+                return 0
+            if code not in _COORDINATOR_NOT_READY:
+                raise
+            if time.monotonic() >= deadline:
+                return 0
+            time.sleep(0.5)
 
 
 def read_committed(
