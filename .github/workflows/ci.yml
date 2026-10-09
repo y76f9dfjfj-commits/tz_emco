@@ -1,0 +1,152 @@
+# Проверки на каждый push и pull request: те же хуки, что локально, плюс тесты на нескольких
+# версиях Python, сканирование всей истории git на секреты и multi-arch сборка образа.
+# Также вызывается из release.yml (workflow_call) как обязательный шаг перед публикацией.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POETRY_VERSION: "2.4.2"
+
+jobs:
+  lint:
+    name: Линтеры, типы, безопасность
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: pipx install "poetry==${POETRY_VERSION}"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: poetry
+      - run: poetry install --no-interaction
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Все pre-commit хуки
+        run: poetry run pre-commit run --all-files --show-diff-on-failure
+
+  secrets-history:
+    name: Секреты во всей истории
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Тесты (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - run: pipx install "poetry==${POETRY_VERSION}"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: poetry
+      - run: poetry env use "python${{ matrix.python-version }}"
+      - run: poetry install --no-interaction
+      - run: make cov
+
+  integration:
+    name: Интеграционные тесты (Kafka)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # Тот же образ и тег, что в docker-compose.yml; KRaft, один узел, порт 9094 для хоста.
+      kafka:
+        image: apache/kafka:4.3.1
+        ports:
+          - 9094:9094
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_HOST://127.0.0.1:9094
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: "1"
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-start-period 30s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - run: pipx install "poetry==${POETRY_VERSION}"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: poetry
+      - run: poetry install --no-interaction
+      # Топики тест создаёт сам (AdminClient); брокер — 127.0.0.1:9094.
+      - name: make test-int
+        run: make test-int
+        timeout-minutes: 15
+
+  docker:
+    name: Сборка Docker-образа (amd64, arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # Обе платформы релиза, без публикации: ломающая arm64 правка видна до тега.
+      - name: Сборка linux/amd64 и linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Multi-arch результат нельзя загрузить в локальный docker: amd64 собирается
+      # повторно из кеша предыдущего шага и загружается для smoke-проверки.
+      - name: Загрузка amd64-образа
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: vqueue:ci
+          cache-from: type=gha
+      - name: Smoke-проверка образа
+        run: |
+          docker run --rm vqueue:ci python -c "import vqueue, confluent_kafka, pydantic"
+          line="$(docker run --rm --no-healthcheck vqueue:ci python -m vqueue.simulator.generator_main \
+            --output stdout --speedup 0 --duration-s 1 --start-ts 1789473600 | head -1)"
+          echo "$line"
+          echo "$line" | python3 -c "import json, sys; assert 'ts' in json.loads(sys.stdin.read())"

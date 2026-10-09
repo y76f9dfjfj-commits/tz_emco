@@ -1,0 +1,131 @@
+# Локальный стенд: брокер Kafka (KRaft, один узел), создание топиков, процессор и генератор.
+# Запуск: make up (docker compose up -d --build). Секретов нет: брокер без аутентификации,
+# порт для хоста — только localhost.
+#
+# Адреса брокера: kafka:9092 — внутри сети compose, 127.0.0.1:9094 — с хоста
+# (локальный процессор, интеграционные тесты).
+
+name: vqueue
+
+x-kafka-image: &kafka-image apache/kafka:4.3.1
+
+services:
+  kafka:
+    image: *kafka-image
+    hostname: kafka
+    # Только loopback IPv4. Анонсируется 127.0.0.1, а не localhost: тот часто резолвится
+    # сначала в ::1, где порт не опубликован.
+    ports:
+      - "127.0.0.1:9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://127.0.0.1:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Один брокер: служебные топики с фактором репликации 1. Без настроек
+      # __transaction_state транзакционный продюсер не инициализируется.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      # Топики создаёт только kafka-init: опечатка в имени не должна молча создавать новый топик.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 10
+
+  # Одноразовое создание топиков; повторный запуск идемпотентен: топики --if-not-exists,
+  # настройки топика состояния переприменяются kafka-configs --alter. Число партиций
+  # существующего топика не изменяется — при смене схемы нужен make reset.
+  kafka-init:
+    image: *kafka-image
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        create() {
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+            --replication-factor 1 --topic "$$@"
+        }
+        # Телеметрия: одна партиция — единый порядок сообщений площадки.
+        create telemetry.v1 --partitions 1
+        create queue.v1 --partitions 4
+        create decision.v1 --partitions 4
+        # Снимок состояния: последний по ключу site_id. Компакция не трогает активный
+        # сегмент: короткий segment.ms и низкий порог грязной доли не дают копиться
+        # старым снимкам, которые иначе перечитываются при каждом восстановлении.
+        state_configs=cleanup.policy=compact,segment.ms=600000,min.cleanable.dirty.ratio=0.1
+        create vqueue.state.v1 --partitions 1 \
+          --config cleanup.policy=compact --config segment.ms=600000 \
+          --config min.cleanable.dirty.ratio=0.1
+        # Существующему топику (создан до появления настроек) — те же настройки, идемпотентно.
+        /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka:9092 --alter \
+          --entity-type topics --entity-name vqueue.state.v1 --add-config "$$state_configs"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --exclude-internal
+    restart: "no"
+
+  processor:
+    build: .
+    image: vqueue:local
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      SITE_CONFIG: /app/config/site.toml
+      SITE_ID: site-1
+      # Стабильный идентификатор: после рестарта init_transactions сразу закрывает
+      # незавершённую транзакцию прежнего запуска, а статическое членство возвращает
+      # партицию без rebalance. Один id — один экземпляр: --scale processor недопустим.
+      INSTANCE_ID: processor-1
+      CONSUMER_GROUP: vqueue-processor-site-1
+      HEALTH_PORT: 8080
+      LOG_LEVEL: INFO
+    ports:
+      - "127.0.0.1:8080:8080"
+    # Остановка ждёт завершения текущего батча (транзакции); с запасом к default 10 с.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # Тот же образ; параметры генератора можно переопределить в docker-compose.override.yml
+  # (Compose подхватывает его автоматически, если файл есть; в репозитории его нет).
+  generator:
+    build: .
+    image: vqueue:local
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    command:
+      - python
+      - -m
+      - vqueue.simulator.generator_main
+      - --bootstrap
+      - kafka:9092
+      - --speedup
+      - "10"
+      - --dup-rate
+      - "0.02"
+      - --late-rate
+      - "0.02"
+    # Health-сервера у генератора нет: проверку из образа отключаем.
+    healthcheck:
+      disable: true
+    restart: on-failure
+
+volumes:
+  kafka-data:
